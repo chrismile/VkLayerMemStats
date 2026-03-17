@@ -1,0 +1,13 @@
+{
+global:
+    /* Export Vulkan symbols for loader. */
+    MemStatsLayer_GetInstanceProcAddr;
+    MemStatsLayer_GetDeviceProcAddr;
+    malloc;
+    malloc;
+    malloc;
+    malloc;
+local:
+    /* Hide all other symbols. */
+    *;
+};
