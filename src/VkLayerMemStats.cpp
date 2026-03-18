@@ -91,7 +91,6 @@ struct DeviceMemInfo {
 static std::map<void*, VkuInstanceDispatchTable> instanceDispatchTables;
 static std::map<void*, VkuDeviceDispatchTable> deviceDispatchTables;
 static std::map<void*, std::shared_ptr<DeviceMemInfo>> deviceMemInfos;
-//static std::unordered_map<void*, uint64_t> cpuAllocations;
 
 #ifdef HOOK_MALLOC
 static HashTable* cpuAllocations = nullptr;
@@ -114,16 +113,6 @@ enum class AllocType {
 
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     scoped_lock l(globalFileMutex);
-    /**MemStatsLayer_outFile << "alloc,";
-    *MemStatsLayer_outFile << std::to_string(int(allocType));
-    *MemStatsLayer_outFile << ",";
-    *MemStatsLayer_outFile << std::to_string(memSize);
-    *MemStatsLayer_outFile << ",";
-    *MemStatsLayer_outFile << ptr;
-    if (allocType == AllocType::GPU) {
-        *MemStatsLayer_outFile << std::to_string(memoryTypeIndex);
-    }
-    *MemStatsLayer_outFile << "\n";*/
     if (allocType == AllocType::CPU) {
         fprintf(MemStatsLayer_outFile, "alloc,%d,%" PRIu64 ",%p\n", int(allocType), memSize, ptr);
     } else {
@@ -133,13 +122,6 @@ static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint
 
 static void removeAllocation(AllocType allocType, uint64_t memSize, void* ptr) {
     scoped_lock l(globalFileMutex);
-    /**MemStatsLayer_outFile << "free,";
-    *MemStatsLayer_outFile << std::to_string(int(allocType));
-    *MemStatsLayer_outFile << ",";
-    *MemStatsLayer_outFile << std::to_string(memSize);
-    *MemStatsLayer_outFile << ",";
-    *MemStatsLayer_outFile << ptr;
-    *MemStatsLayer_outFile << "\n";*/
     fprintf(MemStatsLayer_outFile, "free,%d,%" PRIu64 ",%p\n", int(allocType), memSize, ptr);
 }
 
@@ -420,32 +402,28 @@ static std::mutex globalWinAllocMutex;
 extern "C" {
 
 LPVOID (WINAPI* Real_HeapAlloc)(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) = HeapAlloc;
-LPVOID (WINAPI* Real_HeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) = HeapFree;
+BOOL (WINAPI* Real_HeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) = HeapFree;
 
 LPVOID WINAPI Mine_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) {
     LPVOID ptr = Real_HeapAlloc(hHeap, dwFlags, dwBytes);
     if (!ptr) {
-        return;
+        return ptr;
     }
 
     scoped_lock l(globalWinAllocMutex);
-    //cpuAllocations.insert(std::make_pair(ptr, uint64_t(dwBytes)));
     ht_insert(cpuAllocations, &ptr, &dwBytes);
     addAllocation(AllocType::CPU, uint64_t(dwBytes), (void*)ptr, 0);
 
     return ptr;
 }
 
-LPVOID WINAPI Mine_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
+BOOL WINAPI Mine_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
     BOOL retVal = Real_HeapFree(hHeap, dwFlags, lpMem);
     if (!retVal) {
         return retVal;
     }
 
     scoped_lock l(globalWinAllocMutex);
-    //auto it = cpuAllocations.find(lpMem);
-    //removeAllocation(AllocType::CPU, it->second, (void*)lpMem);
-    //cpuAllocations.erase(it);
     if (ht_contains(cpuAllocations, &lpMem)) {
         size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
         removeAllocation(AllocType::CPU, size, (void*)lpMem);
@@ -472,7 +450,6 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         DetourAttach(&(PVOID&)HeapFree, MemStatsLayer_HeapFree);
         DetourTransactionCommit();
         ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
-        //MemStatsLayer_outFile = new std::ofstream("memstats.csv", std::ofstream::out);
         MemStatsLayer_outFile = fopen("memstats.csv", "w");
     } else if (dwReason == DLL_PROCESS_DETACH) {
         DetourTransactionBegin();
@@ -482,7 +459,6 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         DetourTransactionCommit();
         fclose(MemStatsLayer_outFile);
     }
-    return TRUE;
 #elif defined(USE_MINHOOK)
     if (DetourIsHelperProcess()) {
         return TRUE;
@@ -494,7 +470,6 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         MH_CreateHook(&HeapFree, &MemStatsLayer_HeapFree, reinterpret_cast<LPVOID*>(&Real_HeapFree));
         MH_EnableHook(&HeapFree);
         MH_EnableHook(&HeapAlloc);
-        //MemStatsLayer_outFile = new std::ofstream("memstats.csv", std::ofstream::out);
         MemStatsLayer_outFile = fopen("memstats.csv", "w");
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_DisableHook(&HeapAlloc);
@@ -504,8 +479,8 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         ht_destroy(cpuAllocations);
         fclose(MemStatsLayer_outFile);
     }
-    return TRUE;
 #endif
+    return TRUE;
 }
 
 #endif
@@ -535,8 +510,6 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     }
 
 static void MemStatsLayer_memtrace_init() {
-    write(STDOUT_FILENO, "MemStatsLayer_memtrace_init()\n", strlen("MemStatsLayer_memtrace_init()\n"));
-
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
 
@@ -559,34 +532,24 @@ static void MemStatsLayer_memtrace_init() {
 
 __attribute__((constructor)) void MemStatsLayer_OnLoad() {
     //MemStatsLayer_memtrace_init(); // Didn't work...
-    write(STDOUT_FILENO, "init()\n", strlen("init()\n"));
     ++MemStatsLayer_refcount;
 }
 
 __attribute__((destructor)) void MemStatsLayer_OnFree() {
     --MemStatsLayer_refcount;
-    printf("refcount a: %d\n", MemStatsLayer_refcount.load());
     if (MemStatsLayer_refcount > 0) {
         return;
     }
-    write(STDOUT_FILENO, "malloc 1()\n", strlen("malloc 1()\n"));
     if (MemStatsLayer_outFile) {
         pthread_mutex_lock(&mutex);
         hooked_alloc = true;
 
-    write(STDOUT_FILENO, "malloc 2()\n", strlen("malloc 1()\n"));
         ht_clear(cpuAllocations);
-    write(STDOUT_FILENO, "malloc 3()\n", strlen("malloc 1()\n"));
         ht_destroy(cpuAllocations);
-    write(STDOUT_FILENO, "malloc 4()\n", strlen("malloc 1()\n"));
         free(cpuAllocations);
-    write(STDOUT_FILENO, "malloc 5()\n", strlen("malloc 1()\n"));
         cpuAllocations = nullptr;
-    write(STDOUT_FILENO, "malloc 6()\n", strlen("malloc 1()\n"));
         fclose(MemStatsLayer_outFile);
-    write(STDOUT_FILENO, "malloc 7()\n", strlen("malloc 1()\n"));
         MemStatsLayer_outFile = nullptr;
-    write(STDOUT_FILENO, "malloc 8()\n", strlen("malloc 1()\n"));
         hooked_alloc = false;
         pthread_mutex_unlock(&mutex);
     }
@@ -606,7 +569,6 @@ void* malloc(size_t size) {
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
     {
-        //cpuAllocations.insert(std::make_pair(ptr, uint64_t(size)));
         ht_insert(cpuAllocations, &ptr, &size);
         addAllocation(AllocType::CPU, uint64_t(size), ptr, 0);
     }
@@ -629,9 +591,6 @@ void free(void* ptr) {
     hooked_alloc = true;
     {
         hooked_alloc = true;
-        //auto it = cpuAllocations.find(ptr);
-        //removeAllocation(AllocType::CPU, it->second, ptr);
-        //cpuAllocations.erase(it);
         if (ht_contains(cpuAllocations, &ptr)) {
             size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
             removeAllocation(AllocType::CPU, size, ptr);
@@ -655,7 +614,6 @@ void* calloc(size_t num, size_t size) {
     hooked_alloc = true;
     {
         hooked_alloc = true;
-        //cpuAllocations.insert(std::make_pair(ptr, uint64_t(num * size)));
         size_t total_size = num * size;
         ht_insert(cpuAllocations, &ptr, &total_size);
         addAllocation(AllocType::CPU, uint64_t(num * size), ptr, 0);
@@ -679,10 +637,6 @@ void* realloc(void* ptr, size_t new_size) {
     hooked_alloc = true;
     {
         hooked_alloc = true;
-        //auto it = cpuAllocations.find(ptr);
-        //removeAllocation(AllocType::CPU, it->second, ptr);
-        //cpuAllocations.erase(it);
-        //cpuAllocations.insert(std::make_pair(new_ptr, uint64_t(new_size)));
         if (ht_contains(cpuAllocations, &ptr)) {
             size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
             removeAllocation(AllocType::CPU, size, ptr);
