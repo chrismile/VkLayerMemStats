@@ -11,6 +11,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
 endif()
 
+option(HOOK_MALLOC "Hook CPU memory allocation/deallocation." OFF)
 option(USE_STATIC_STD_LIBRARIES "Link with standard libraries statically." OFF)
 set(DATA_PATH "${CMAKE_SOURCE_DIR}/Data" CACHE PATH "Location of folder 'Data'")
 
@@ -19,6 +20,7 @@ if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
 endif()
 
 file(GLOB_RECURSE SOURCES src/*.cpp src/*.c src/*.hpp src/*.h)
+list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hashtable/hashtable.c")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings_helper.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/layer_settings_util.cpp")
@@ -27,6 +29,8 @@ list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libr
 add_library(VkLayer_memstats SHARED ${SOURCES})
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Headers/include)
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Utility-Libraries/include)
+target_include_directories(VkLayer_memstats PRIVATE third_party/hashtable)
+target_include_directories(VkLayer_memstats PRIVATE third_party)
 
 if (${USE_STATIC_STD_LIBRARIES})
     if (MSYS OR MINGW OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -35,6 +39,10 @@ if (${USE_STATIC_STD_LIBRARIES})
     if (MSYS OR MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
         target_link_options(VkLayer_memstats PRIVATE -static -lpthread)
     endif()
+endif()
+
+if (${HOOK_MALLOC})
+    target_compile_definitions(VkLayer_memstats PRIVATE HOOK_MALLOC)
 endif()
 
 if (UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

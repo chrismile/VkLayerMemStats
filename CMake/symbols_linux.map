@@ -4,9 +4,9 @@ global:
     MemStatsLayer_GetInstanceProcAddr;
     MemStatsLayer_GetDeviceProcAddr;
     malloc;
-    malloc;
-    malloc;
-    malloc;
+    free;
+    calloc;
+    realloc;
 local:
     /* Hide all other symbols. */
     *;

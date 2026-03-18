@@ -2,6 +2,9 @@
 
 A Vulkan layer for dumping memory statistics.
 
+When using the layer, memory statistics will be dumped to a file memstats.csv. The layer can either only dump Vulkan
+memory allocations, or also CPU memory allocations (see "CPU memory allocation hooking").
+
 
 ## How to build
 
@@ -69,3 +72,47 @@ $env:VK_ADD_LAYER_PATH = "<...>"
 $env:VK_LOADER_LAYERS_ENABLE = "*memstats"
 $env:VK_VSYNC = "off"
 ```
+
+
+## CPU memory allocation hooking
+
+By default, the Vulkan layer will only dump statistics for Vulkan memory allocations.
+When configuring with the option `-DHOOK_MALLOC=ON`, CPU memory allocation functions will be hooked as well.
+Additionally, on Linux `LD_PRELOAD` needs to point to the Vulkan layer shared library, e.g.:
+```shell
+export LD_PRELOAD=<PATH>/libVkLayer_memstats.so
+export VK_ADD_LAYER_PATH=<PATH>
+export VK_LOADER_LAYERS_ENABLE=*memstats
+```
+
+For more details on the malloc hooking mechanism on Linux, please refer to
+https://sourceware.org/glibc/manual/2.43/html_mono/libc.html#Replacing-malloc.
+
+On Windows, [Detours](https://github.com/microsoft/Detours) or [MinHook](https://github.com/TsudaKageyu/minhook)
+can be used for similarly hooking CPU memory allocations.
+
+Please note that during testing this on Linux, weird things happened when using malloc hooking together with Vulkan
+apps using DLSS. Calling `NVSDK_NGX_VULKAN_GetFeatureRequirements` caused the shared library constructor and destructor
+to be triggered two additional times.
+
+Furthermore, please note that compiling with `-DHOOK_MALLOC=ON` and not using `LD_PRELOAD` will lead to crashes when
+the Vulkan layer calls fprintf to write to the output file.
+
+
+## File output format
+
+When using the layer, memory statistics will be dumped to a file memstats.csv.
+One line of the file contains one data record. Individual entries are separated by commas.
+
+The first entry denotes the type of the record.
+- An entry starting with `alloc` denotes a memory allocation.
+  Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
+  Optional entries: Memory type index (only for GPU)
+- An entry starting with `free` denotes a memory deallocation.
+  Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
+- An entry starting with `memheap` is written when a new Vulkan device is created.
+  Additional entries: Size in bytes, flags
+- An entry starting with `memtype` is written when a new Vulkan device is created.
+  Additional entries: Heap index, property flags
+- An entry starting with `submit` is written when `vkQueueSubmit` is called. 
+- An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called. 
