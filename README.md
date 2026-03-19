@@ -104,15 +104,17 @@ the Vulkan layer calls fprintf to write to the output file.
 When using the layer, memory statistics will be dumped to a file memstats.csv.
 One line of the file contains one data record. Individual entries are separated by commas.
 
-The first entry denotes the type of the record.
+The first entry denotes the type of the record. The second entry is always a timestamp in nanoseconds.
 - An entry starting with `alloc` denotes a memory allocation.
   Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
   Optional entries: Memory type index (only for GPU)
 - An entry starting with `free` denotes a memory deallocation.
   Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
+- An entry starting with `devinfo` is written when a new Vulkan device is created.
+  Additional entries: Device type (VkPhysicalDeviceType), device name
 - An entry starting with `memheap` is written when a new Vulkan device is created.
-  Additional entries: Size in bytes, flags
+  Additional entries: Heap index, size in bytes, flags
 - An entry starting with `memtype` is written when a new Vulkan device is created.
-  Additional entries: Heap index, property flags
+  Additional entries: Type index, heap index, property flags
 - An entry starting with `submit` is written when `vkQueueSubmit` is called. 
 - An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called. 

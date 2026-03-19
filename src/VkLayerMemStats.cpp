@@ -33,6 +33,7 @@
 #include <iostream>
 #include <map>
 #include <unordered_map>
+#include <chrono>
 #include <fstream>
 #include <atomic>
 #include <memory>
@@ -105,7 +106,21 @@ static std::mutex globalFileMutex;
 typedef std::lock_guard<std::mutex> scoped_lock;
 // Cannot use static; https://stackoverflow.com/questions/12463718/linux-equivalent-of-dllmain
 std::atomic<int> MemStatsLayer_refcount = 0;
+std::chrono::high_resolution_clock::time_point MemStatsLayer_startTime;
 FILE* MemStatsLayer_outFile;
+
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool hooked_alloc = false;
+pid_t MemStatsLayer_pid = 0;
+#endif
+
+uint64_t getTimeStamp() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(now - MemStatsLayer_startTime).count();
+    static_assert(sizeof(nanoseconds) == sizeof(uint64_t));
+    return uint64_t(nanoseconds);
+}
 
 enum class AllocType {
     CPU = 0, GPU = 1
@@ -114,20 +129,27 @@ enum class AllocType {
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     scoped_lock l(globalFileMutex);
     if (allocType == AllocType::CPU) {
-        fprintf(MemStatsLayer_outFile, "alloc,%d,%" PRIu64 ",%p\n", int(allocType), memSize, ptr);
+        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+                getTimeStamp(), int(allocType), memSize, ptr);
     } else {
-        fprintf(MemStatsLayer_outFile, "alloc,%d,%" PRIu64 ",%p,%u\n", int(allocType), memSize, ptr, memoryTypeIndex);
+        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
+                getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
     }
+    fflush(MemStatsLayer_outFile);
+    fflush(MemStatsLayer_outFile);
 }
 
 static void removeAllocation(AllocType allocType, uint64_t memSize, void* ptr) {
     scoped_lock l(globalFileMutex);
-    fprintf(MemStatsLayer_outFile, "free,%d,%" PRIu64 ",%p\n", int(allocType), memSize, ptr);
+    fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+            getTimeStamp(), int(allocType), memSize, ptr);
+    fflush(MemStatsLayer_outFile);
+    fflush(MemStatsLayer_outFile);
 }
 
 
-VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EnumerateInstanceLayerProperties(uint32_t* pPropertyCount,
-    VkLayerProperties* pProperties) {
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EnumerateInstanceLayerProperties(
+        uint32_t* pPropertyCount, VkLayerProperties* pProperties) {
     if (pPropertyCount) {
         *pPropertyCount = 1;
     }
@@ -218,6 +240,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateInstance(
 #ifndef HOOK_MALLOC
         if (MemStatsLayer_refcount == 0) {
             MemStatsLayer_outFile = fopen("memstats.csv", "w");
+            MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
         }
         ++MemStatsLayer_refcount;
 #endif
@@ -274,6 +297,42 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.QueueSubmit = (PFN_vkQueueSubmit)pGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
     dispatchTable.AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)pGetDeviceProcAddr(*pDevice, "vkAcquireNextImageKHR");
 
+    // Write memory statistics.
+    VkPhysicalDeviceProperties deviceProperties{};
+    VkPhysicalDeviceMemoryProperties deviceMemoryProperties{};
+    auto pGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)pGetInstanceProcAddr(
+            VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
+    auto pGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)pGetInstanceProcAddr(
+            VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    pGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+    pGetPhysicalDeviceMemoryProperties(physicalDevice, &deviceMemoryProperties);
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    pthread_mutex_lock(&mutex);
+    hooked_alloc = true;
+#endif
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        scoped_lock l(globalFileMutex);
+        fprintf(MemStatsLayer_outFile, "devinfo,%" PRIu64 ",%u,%s\n",
+                getTimeStamp(), uint32_t(deviceProperties.deviceType), deviceProperties.deviceName);
+        for (uint32_t heapIdx = 0; heapIdx < deviceMemoryProperties.memoryHeapCount; heapIdx++) {
+            auto& memHeap = deviceMemoryProperties.memoryHeaps[heapIdx];
+            fprintf(MemStatsLayer_outFile, "memheap,%" PRIu64 ",%u,%" PRIu64 ",%u\n",
+                    getTimeStamp(), heapIdx, uint64_t(memHeap.size), uint32_t(memHeap.flags));
+        }
+        for (uint32_t memoryTypeIdx = 0; memoryTypeIdx < deviceMemoryProperties.memoryTypeCount; memoryTypeIdx++) {
+            auto& memType = deviceMemoryProperties.memoryTypes[memoryTypeIdx];
+            fprintf(MemStatsLayer_outFile, "memtype,%" PRIu64 ",%u,%u,%u\n",
+                    getTimeStamp(), memoryTypeIdx, memType.heapIndex, uint32_t(memType.propertyFlags));
+        }
+    }
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    hooked_alloc = false;
+    pthread_mutex_unlock(&mutex);
+#endif
+
     {
         scoped_lock l(globalMutex);
         deviceDispatchTables[getDispatchKey(*pDevice)] = dispatchTable;
@@ -300,9 +359,22 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AllocateMemory(
         return res;
     }
 
-    addAllocation(AllocType::GPU, pAllocateInfo->allocationSize, *pMemory, pAllocateInfo->memoryTypeIndex);
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    pthread_mutex_lock(&mutex);
+    hooked_alloc = true;
+#endif
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        addAllocation(AllocType::GPU, pAllocateInfo->allocationSize, *pMemory, pAllocateInfo->memoryTypeIndex);
+    }
     auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
     allocatedMemoryBlocks.insert(std::make_pair(*pMemory, pAllocateInfo->allocationSize));
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    hooked_alloc = false;
+    pthread_mutex_unlock(&mutex);
+#endif
 
     return res;
 }
@@ -311,13 +383,28 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_FreeMemory(
         VkDevice device, const VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    pthread_mutex_lock(&mutex);
+    hooked_alloc = true;
+#endif
     auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
     auto it = allocatedMemoryBlocks.find(memory);
     if (it == allocatedMemoryBlocks.end()) {
         return;
     }
-    removeAllocation(AllocType::GPU, it->second, memory);
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        removeAllocation(AllocType::GPU, it->second, memory);
+    }
     allocatedMemoryBlocks.erase(it);
+    it = {};
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    hooked_alloc = false;
+    pthread_mutex_unlock(&mutex);
+#endif
+
     deviceDispatchTables[getDispatchKey(device)].FreeMemory(device, memory, pAllocator);
 }
 
@@ -330,7 +417,21 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
         return res;
     }
 
-    fprintf(MemStatsLayer_outFile, "submit\n");
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    pthread_mutex_lock(&mutex);
+    hooked_alloc = true;
+#endif
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        scoped_lock l(globalFileMutex);
+        fprintf(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", getTimeStamp());
+    }
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    hooked_alloc = false;
+    pthread_mutex_unlock(&mutex);
+#endif
 
     return res;
 }
@@ -346,7 +447,21 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AcquireNextImageKHR
         return res;
     }
 
-    fprintf(MemStatsLayer_outFile, "acquire_next_image\n");
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    pthread_mutex_lock(&mutex);
+    hooked_alloc = true;
+#endif
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        scoped_lock l(globalFileMutex);
+        fprintf(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
+    }
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    hooked_alloc = false;
+    pthread_mutex_unlock(&mutex);
+#endif
 
     return res;
 }
@@ -451,6 +566,7 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         DetourTransactionCommit();
         ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
         MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
     } else if (dwReason == DLL_PROCESS_DETACH) {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -471,6 +587,7 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         MH_EnableHook(&HeapFree);
         MH_EnableHook(&HeapAlloc);
         MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_DisableHook(&HeapAlloc);
         MH_DisableHook(&HeapFree);
@@ -501,8 +618,6 @@ static malloc_type real_malloc = nullptr;
 static free_type real_free = nullptr;
 static calloc_type real_calloc = nullptr;
 static realloc_type real_realloc = nullptr;
-static bool hooked_alloc = false;
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define CHECK_DLSYM(f) \
     if (!real_##f) { \
@@ -522,7 +637,12 @@ static void MemStatsLayer_memtrace_init() {
     real_realloc = (realloc_type)dlsym(RTLD_NEXT, "realloc");
     CHECK_DLSYM(realloc);
 
+    if (MemStatsLayer_pid == 0) {
+        MemStatsLayer_pid = getpid();
+    }
+
     MemStatsLayer_outFile = fopen("memstats.csv", "w");
+    MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
     cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
     ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
 
@@ -532,6 +652,12 @@ static void MemStatsLayer_memtrace_init() {
 
 __attribute__((constructor)) void MemStatsLayer_OnLoad() {
     //MemStatsLayer_memtrace_init(); // Didn't work...
+    /**
+     * Environment variables such as LD_PRELOAD are inherited by child processes.
+     * As we are not attaching the pid to the file name, we must avoid child processes writing to the same file and
+     * causing data races.
+     */
+    unsetenv("LD_PRELOAD");
     ++MemStatsLayer_refcount;
 }
 
@@ -550,6 +676,7 @@ __attribute__((destructor)) void MemStatsLayer_OnFree() {
         cpuAllocations = nullptr;
         fclose(MemStatsLayer_outFile);
         MemStatsLayer_outFile = nullptr;
+
         hooked_alloc = false;
         pthread_mutex_unlock(&mutex);
     }
@@ -562,16 +689,14 @@ void* malloc(size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_malloc(size);
-    if (hooked_alloc || !cpuAllocations) {
+    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
-    {
-        ht_insert(cpuAllocations, &ptr, &size);
-        addAllocation(AllocType::CPU, uint64_t(size), ptr, 0);
-    }
+    ht_insert(cpuAllocations, &ptr, &size);
+    addAllocation(AllocType::CPU, uint64_t(size), ptr, 0);
     hooked_alloc = false;
     pthread_mutex_unlock(&mutex);
 
@@ -583,19 +708,16 @@ void free(void* ptr) {
         MemStatsLayer_memtrace_init();
     }
     real_free(ptr);
-    if (hooked_alloc || !cpuAllocations) {
+    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
         return;
     }
 
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
-    {
-        hooked_alloc = true;
-        if (ht_contains(cpuAllocations, &ptr)) {
-            size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
-            removeAllocation(AllocType::CPU, size, ptr);
-            ht_erase(cpuAllocations, &ptr);
-        }
+    if (ht_contains(cpuAllocations, &ptr)) {
+        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
+        removeAllocation(AllocType::CPU, size, ptr);
+        ht_erase(cpuAllocations, &ptr);
     }
     hooked_alloc = false;
     pthread_mutex_unlock(&mutex);
@@ -606,18 +728,15 @@ void* calloc(size_t num, size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_calloc(num, size);
-    if (hooked_alloc || !cpuAllocations) {
+    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
-    {
-        hooked_alloc = true;
-        size_t total_size = num * size;
-        ht_insert(cpuAllocations, &ptr, &total_size);
-        addAllocation(AllocType::CPU, uint64_t(num * size), ptr, 0);
-    }
+    size_t total_size = num * size;
+    ht_insert(cpuAllocations, &ptr, &total_size);
+    addAllocation(AllocType::CPU, uint64_t(num * size), ptr, 0);
     hooked_alloc = false;
     pthread_mutex_unlock(&mutex);
 
@@ -629,22 +748,19 @@ void* realloc(void* ptr, size_t new_size) {
         MemStatsLayer_memtrace_init();
     }
     void* new_ptr = real_realloc(ptr, new_size);
-    if (hooked_alloc || !cpuAllocations) {
+    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
         return new_ptr;
     }
 
     pthread_mutex_lock(&mutex);
     hooked_alloc = true;
-    {
-        hooked_alloc = true;
-        if (ht_contains(cpuAllocations, &ptr)) {
-            size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
-            removeAllocation(AllocType::CPU, size, ptr);
-            ht_erase(cpuAllocations, &ptr);
-        }
-        ht_insert(cpuAllocations, &new_ptr, &new_size);
-        addAllocation(AllocType::CPU, uint64_t(new_size), new_ptr, 0);
+    if (ht_contains(cpuAllocations, &ptr)) {
+        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
+        removeAllocation(AllocType::CPU, size, ptr);
+        ht_erase(cpuAllocations, &ptr);
     }
+    ht_insert(cpuAllocations, &new_ptr, &new_size);
+    addAllocation(AllocType::CPU, uint64_t(new_size), new_ptr, 0);
     hooked_alloc = false;
     pthread_mutex_unlock(&mutex);
 
