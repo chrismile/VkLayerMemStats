@@ -101,7 +101,7 @@ static HashTable* cpuAllocations = nullptr;
  * Theoretically, we could switch to vku::concurrent::unordered_map, but this is likely not a performance bottleneck.
  */
 static std::mutex globalMutex;
-static std::mutex globalFileMutex;
+static std::mutex globalAllocMutex;
 typedef std::lock_guard<std::mutex> scoped_lock;
 // Cannot use static; https://stackoverflow.com/questions/12463718/linux-equivalent-of-dllmain
 std::chrono::high_resolution_clock::time_point MemStatsLayer_startTime;
@@ -111,12 +111,37 @@ FILE* MemStatsLayer_outFile;
 std::atomic<int> MemStatsLayer_refcount = 0;
 #endif
 
+#ifdef _WIN32
+static std::mutex allocMutex;
+#else
+static pthread_mutex_t allocMutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 #ifdef HOOK_MALLOC
+
 static bool hooked_alloc = false;
+
+#ifdef _WIN32
+#define ACQUIRE_ALLOC() allocMutex.lock(); hooked_alloc = true;
+#define RELEASE_ALLOC() hooked_alloc = false; allocMutex.unlock();
+#else
+#define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex); hooked_alloc = true;
+#define RELEASE_ALLOC() hooked_alloc = false; pthread_mutex_unlock(&mutex);
+#endif
+
+#else // !defined(HOOK_MALLOC)
+
+#ifdef _WIN32
+#define ACQUIRE_ALLOC() allocMutex.lock();
+#define RELEASE_ALLOC() allocMutex.unlock();
+#else
+#define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex);
+#define RELEASE_ALLOC() pthread_mutex_unlock(&mutex);
+#endif
+
 #endif
 
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pid_t MemStatsLayer_pid = 0;
 #endif
 
@@ -132,21 +157,19 @@ enum class AllocType {
 };
 
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
-    scoped_lock l(globalFileMutex);
-    //if (allocType == AllocType::CPU) {
-    //    fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
-    //            getTimeStamp(), int(allocType), memSize, ptr);
-    //} else {
-    //    fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
-    //            getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
-    //}
+    if (allocType == AllocType::CPU) {
+        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+                getTimeStamp(), int(allocType), memSize, ptr);
+    } else {
+        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
+                getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
+    }
     //fflush(MemStatsLayer_outFile);
 }
 
 static void removeAllocation(AllocType allocType, uint64_t memSize, void* ptr) {
-    scoped_lock l(globalFileMutex);
-    //fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
-    //        getTimeStamp(), int(allocType), memSize, ptr);
+    fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+            getTimeStamp(), int(allocType), memSize, ptr);
     //fflush(MemStatsLayer_outFile);
 }
 
@@ -309,15 +332,11 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
             VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
     pGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
     pGetPhysicalDeviceMemoryProperties(physicalDevice, &deviceMemoryProperties);
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
-#endif
+    ACQUIRE_ALLOC();
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        scoped_lock l(globalFileMutex);
         fprintf(MemStatsLayer_outFile, "devinfo,%" PRIu64 ",%u,%s\n",
                 getTimeStamp(), uint32_t(deviceProperties.deviceType), deviceProperties.deviceName);
         for (uint32_t heapIdx = 0; heapIdx < deviceMemoryProperties.memoryHeapCount; heapIdx++) {
@@ -331,10 +350,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
                     getTimeStamp(), memoryTypeIdx, memType.heapIndex, uint32_t(memType.propertyFlags));
         }
     }
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
-#endif
+    RELEASE_ALLOC();
 
     {
         scoped_lock l(globalMutex);
@@ -362,10 +378,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AllocateMemory(
         return res;
     }
 
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
-#endif
+    ACQUIRE_ALLOC();
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
     if (getpid() == MemStatsLayer_pid)
 #endif
@@ -374,10 +387,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AllocateMemory(
     }
     auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
     allocatedMemoryBlocks.insert(std::make_pair(*pMemory, pAllocateInfo->allocationSize));
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
-#endif
+    RELEASE_ALLOC();
 
     return res;
 }
@@ -386,10 +396,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_FreeMemory(
         VkDevice device, const VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
-#endif
+    ACQUIRE_ALLOC();
     auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
     auto it = allocatedMemoryBlocks.find(memory);
     if (it == allocatedMemoryBlocks.end()) {
@@ -403,10 +410,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_FreeMemory(
     }
     allocatedMemoryBlocks.erase(it);
     it = {};
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
-#endif
+    RELEASE_ALLOC();
 
     deviceDispatchTables[getDispatchKey(device)].FreeMemory(device, memory, pAllocator);
 }
@@ -420,21 +424,15 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
         return res;
     }
 
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
-#endif
+    ACQUIRE_ALLOC();
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        scoped_lock l(globalFileMutex);
         fprintf(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", getTimeStamp());
     }
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
-#endif
+    RELEASE_ALLOC();
+
 
     return res;
 }
@@ -450,21 +448,14 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AcquireNextImageKHR
         return res;
     }
 
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
-#endif
+    ACQUIRE_ALLOC();
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        scoped_lock l(globalFileMutex);
         fprintf(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
     }
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
-#endif
+    RELEASE_ALLOC();
 
     return res;
 }
@@ -519,8 +510,12 @@ static std::mutex globalWinAllocMutex;
 
 extern "C" {
 
-LPVOID (WINAPI* Real_HeapAlloc)(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) = HeapAlloc;
+// https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc
+LPVOID (WINAPI* Real_HeapAlloc)(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes) = HeapAlloc;
+// https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapfree
 BOOL (WINAPI* Real_HeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) = HeapFree;
+// https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc
+LPVOID (WINAPI* Real_HeapReAlloc)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes) = HeapReAlloc;
 
 LPVOID WINAPI MemStatsLayer_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) {
     LPVOID ptr = Real_HeapAlloc(hHeap, dwFlags, dwBytes);
@@ -528,11 +523,10 @@ LPVOID WINAPI MemStatsLayer_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwB
         return ptr;
     }
 
-    scoped_lock l(globalWinAllocMutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     ht_insert(cpuAllocations, &ptr, &dwBytes);
     addAllocation(AllocType::CPU, uint64_t(dwBytes), (void*)ptr, 0);
-    hooked_alloc = false;
+    RELEASE_ALLOC();
 
     return ptr;
 }
@@ -543,16 +537,35 @@ BOOL WINAPI MemStatsLayer_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
         return retVal;
     }
 
-    scoped_lock l(globalWinAllocMutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     if (ht_contains(cpuAllocations, &lpMem)) {
         size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
         removeAllocation(AllocType::CPU, size, (void*)lpMem);
         ht_erase(cpuAllocations, &lpMem);
     }
-    hooked_alloc = false;
+    RELEASE_ALLOC();
 
     return retVal;
+}
+
+LPVOID WINAPI MemStatsLayer_HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes) {
+    LPVOID new_ptr = Real_HeapReAlloc(hHeap, dwFlags, lpMem, dwBytes);
+    if (!new_ptr || hooked_alloc) {
+        return new_ptr;
+    }
+
+    ACQUIRE_ALLOC();
+    auto new_size = uint64_t(dwBytes);
+    if (ht_contains(cpuAllocations, &lpMem)) {
+        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
+        removeAllocation(AllocType::CPU, size, lpMem);
+        ht_erase(cpuAllocations, &lpMem);
+    }
+    ht_insert(cpuAllocations, &new_ptr, &new_size);
+    addAllocation(AllocType::CPU, new_size, new_ptr, 0);
+    RELEASE_ALLOC();
+
+    return new_ptr;
 }
 
 }
@@ -573,14 +586,16 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         DetourRestoreAfterWith();
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
-        DetourAttach(&(PVOID&)HeapAlloc, MemStatsLayer_HeapAlloc);
-        DetourAttach(&(PVOID&)HeapFree, MemStatsLayer_HeapFree);
+        DetourAttach(&(PVOID&)Real_HeapAlloc, MemStatsLayer_HeapAlloc);
+        DetourAttach(&(PVOID&)Real_HeapFree, MemStatsLayer_HeapFree);
+        DetourAttach(&(PVOID&)Real_HeapReAlloc, MemStatsLayer_HeapReAlloc);
         DetourTransactionCommit();
     } else if (dwReason == DLL_PROCESS_DETACH) {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
-        DetourDetach(&(PVOID&)HeapAlloc, MemStatsLayer_HeapAlloc);
-        DetourDetach(&(PVOID&)HeapFree, MemStatsLayer_HeapFree);
+        DetourDetach(&(PVOID&)Real_HeapAlloc, MemStatsLayer_HeapAlloc);
+        DetourDetach(&(PVOID&)Real_HeapFree, MemStatsLayer_HeapFree);
+        DetourDetach(&(PVOID&)Real_HeapReAlloc, MemStatsLayer_HeapReAlloc);
         DetourTransactionCommit();
 
         ht_clear(cpuAllocations);
@@ -595,13 +610,16 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
 
         MH_Initialize();
-        MH_CreateHook(&HeapAlloc, &MemStatsLayer_HeapAlloc, reinterpret_cast<LPVOID*>(&Real_HeapAlloc));
-        MH_CreateHook(&HeapFree, &MemStatsLayer_HeapFree, reinterpret_cast<LPVOID*>(&Real_HeapFree));
-        MH_EnableHook(&HeapFree);
-        MH_EnableHook(&HeapAlloc);
+        MH_CreateHook(&Real_HeapAlloc, &MemStatsLayer_HeapAlloc, reinterpret_cast<LPVOID*>(&Real_HeapAlloc));
+        MH_CreateHook(&Real_HeapFree, &MemStatsLayer_HeapFree, reinterpret_cast<LPVOID*>(&Real_HeapFree));
+        MH_CreateHook(&Real_HeapReAlloc, &MemStatsLayer_HeapReAlloc, reinterpret_cast<LPVOID*>(&Real_HeapReAlloc));
+        MH_EnableHook(&Real_HeapFree);
+        MH_EnableHook(&Real_HeapAlloc);
+        MH_EnableHook(&Real_HeapReAlloc);
     } else if (dwReason == DLL_PROCESS_DETACH) {
-        MH_DisableHook(&HeapAlloc);
-        MH_DisableHook(&HeapFree);
+        MH_DisableHook(&Real_HeapAlloc);
+        MH_DisableHook(&Real_HeapFree);
+        MH_DisableHook(&Real_HeapReAlloc);
         MH_Uninitialize();
 
         ht_clear(cpuAllocations);
@@ -637,8 +655,7 @@ static realloc_type real_realloc = nullptr;
     }
 
 static void MemStatsLayer_memtrace_init() {
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
 
     real_malloc = (malloc_type)dlsym(RTLD_NEXT, "malloc");
     CHECK_DLSYM(malloc);
@@ -658,8 +675,7 @@ static void MemStatsLayer_memtrace_init() {
     cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
     ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
 
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
+    RELEASE_ALLOC();
 }
 
 __attribute__((constructor)) void MemStatsLayer_OnLoad() {
@@ -679,8 +695,7 @@ __attribute__((destructor)) void MemStatsLayer_OnFree() {
         return;
     }
     if (MemStatsLayer_outFile) {
-        pthread_mutex_lock(&mutex);
-        hooked_alloc = true;
+        ACQUIRE_ALLOC();
 
         ht_clear(cpuAllocations);
         ht_destroy(cpuAllocations);
@@ -689,8 +704,7 @@ __attribute__((destructor)) void MemStatsLayer_OnFree() {
         fclose(MemStatsLayer_outFile);
         MemStatsLayer_outFile = nullptr;
 
-        hooked_alloc = false;
-        pthread_mutex_unlock(&mutex);
+        RELEASE_ALLOC();
     }
 }
 
@@ -705,12 +719,10 @@ void* malloc(size_t size) {
         return ptr;
     }
 
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     ht_insert(cpuAllocations, &ptr, &size);
     addAllocation(AllocType::CPU, uint64_t(size), ptr, 0);
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
+    RELEASE_ALLOC();
 
     return ptr;
 }
@@ -724,15 +736,13 @@ void free(void* ptr) {
         return;
     }
 
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     if (ht_contains(cpuAllocations, &ptr)) {
         size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
         removeAllocation(AllocType::CPU, size, ptr);
         ht_erase(cpuAllocations, &ptr);
     }
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
+    RELEASE_ALLOC();
 }
 
 void* calloc(size_t num, size_t size) {
@@ -744,13 +754,11 @@ void* calloc(size_t num, size_t size) {
         return ptr;
     }
 
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     size_t total_size = num * size;
     ht_insert(cpuAllocations, &ptr, &total_size);
     addAllocation(AllocType::CPU, uint64_t(num * size), ptr, 0);
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
+    RELEASE_ALLOC();
 
     return ptr;
 }
@@ -764,8 +772,7 @@ void* realloc(void* ptr, size_t new_size) {
         return new_ptr;
     }
 
-    pthread_mutex_lock(&mutex);
-    hooked_alloc = true;
+    ACQUIRE_ALLOC();
     if (ht_contains(cpuAllocations, &ptr)) {
         size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
         removeAllocation(AllocType::CPU, size, ptr);
@@ -773,8 +780,7 @@ void* realloc(void* ptr, size_t new_size) {
     }
     ht_insert(cpuAllocations, &new_ptr, &new_size);
     addAllocation(AllocType::CPU, uint64_t(new_size), new_ptr, 0);
-    hooked_alloc = false;
-    pthread_mutex_unlock(&mutex);
+    RELEASE_ALLOC();
 
     return new_ptr;
 }
