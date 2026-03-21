@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.0)
+cmake_minimum_required(VERSION 3.18...4.0)
 project(VkLayerMemStats)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -13,6 +13,8 @@ endif()
 
 option(HOOK_MALLOC "Hook CPU memory allocation/deallocation." OFF)
 option(USE_STATIC_STD_LIBRARIES "Link with standard libraries statically." OFF)
+option(USE_DETOURS "Use Detours for CPU memory allocation/deallocation hooking (Windows only)." OFF)
+option(USE_MINHOOK "Use MinHook for CPU memory allocation/deallocation hooking (Windows only)." OFF)
 set(DATA_PATH "${CMAKE_SOURCE_DIR}/Data" CACHE PATH "Location of folder 'Data'")
 
 if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
@@ -43,6 +45,61 @@ endif()
 
 if (${HOOK_MALLOC})
     target_compile_definitions(VkLayer_memstats PRIVATE HOOK_MALLOC)
+endif()
+
+# Unit tests.
+if (WIN32 AND ${HOOK_MALLOC})
+    include(FetchContent)
+    if (${USE_DETOURS})
+        FetchContent_Declare(
+                detours
+                GIT_REPOSITORY https://github.com/microsoft/Detours.git
+                GIT_TAG        9764cebcb1a75940e68fa83d6730ffaf0f669401
+        )
+        FetchContent_MakeAvailable(detours)
+        list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/detours.cpp")
+        list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/creatwth.cpp")
+        list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/image.cpp")
+        list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/modules.cpp")
+        list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/disasm.cpp")
+        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+            list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/disolx64.cpp")
+        elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "X86")
+            list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/disolx86.cpp")
+        elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64")
+            list(APPEND DETOURS_SOURCES "${detours_SOURCE_DIR}/src/disolarm64.cpp")
+        else()
+            message(FATAL_ERROR "Unsupported architecture.")
+        endif()
+        add_library(detours STATIC ${DETOURS_SOURCES})
+        target_include_directories(detours PUBLIC "${detours_SOURCE_DIR}/src")
+        target_compile_definitions(VkLayer_memstats PRIVATE USE_DETOURS)
+        target_link_libraries(VkLayer_memstats PRIVATE detours)
+    elseif (${USE_MINHOOK})
+        FetchContent_Declare(
+                minhook
+                GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+                GIT_TAG        1e9ad1eb42db11bfcb65461f687c656612d1b555
+                SOURCE_SUBDIR  nosubdir
+        )
+        FetchContent_MakeAvailable(minhook)
+        list(APPEND MINHOOK_SOURCES "${minhook_SOURCE_DIR}/src/buffer.c")
+        list(APPEND MINHOOK_SOURCES "${minhook_SOURCE_DIR}/src/hook.c")
+        list(APPEND MINHOOK_SOURCES "${minhook_SOURCE_DIR}/src/trampoline.c")
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            list(APPEND MINHOOK_SOURCES "${minhook_SOURCE_DIR}/src/hde/hde64.c")
+        else()
+            list(APPEND MINHOOK_SOURCES "${minhook_SOURCE_DIR}/src/hde/hde32.c")
+        endif()
+        add_library(minhook STATIC ${MINHOOK_SOURCES})
+        target_include_directories(minhook PUBLIC ${minhook_SOURCE_DIR}/include)
+        target_include_directories(minhook PRIVATE ${minhook_SOURCE_DIR}/src)
+        target_include_directories(minhook PRIVATE ${minhook_SOURCE_DIR}/src/hde)
+        target_compile_definitions(VkLayer_memstats PRIVATE USE_MINHOOK)
+        target_link_libraries(VkLayer_memstats PRIVATE minhook)
+    else()
+        message(FATAL_ERROR "HOOK_MALLOC enabled, but no library selected.")
+    endif()
 endif()
 
 if (UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

@@ -60,7 +60,6 @@ extern "C" {
 #elif defined(USE_MINHOOK)
 // https://github.com/TsudaKageyu/minhook
 #include <MinHook.h>
-#pragma comment(lib, "libMinHook.x64.lib")
 #endif
 #else // !defined(_WIN32)
 #include <cstdio>
@@ -105,13 +104,19 @@ static std::mutex globalMutex;
 static std::mutex globalFileMutex;
 typedef std::lock_guard<std::mutex> scoped_lock;
 // Cannot use static; https://stackoverflow.com/questions/12463718/linux-equivalent-of-dllmain
-std::atomic<int> MemStatsLayer_refcount = 0;
 std::chrono::high_resolution_clock::time_point MemStatsLayer_startTime;
 FILE* MemStatsLayer_outFile;
 
+#if !defined(HOOK_MALLOC) || !defined(_WIN32)
+std::atomic<int> MemStatsLayer_refcount = 0;
+#endif
+
+#ifdef HOOK_MALLOC
+static bool hooked_alloc = false;
+#endif
+
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool hooked_alloc = false;
 pid_t MemStatsLayer_pid = 0;
 #endif
 
@@ -128,23 +133,21 @@ enum class AllocType {
 
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     scoped_lock l(globalFileMutex);
-    if (allocType == AllocType::CPU) {
-        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
-                getTimeStamp(), int(allocType), memSize, ptr);
-    } else {
-        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
-                getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
-    }
-    fflush(MemStatsLayer_outFile);
-    fflush(MemStatsLayer_outFile);
+    //if (allocType == AllocType::CPU) {
+    //    fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+    //            getTimeStamp(), int(allocType), memSize, ptr);
+    //} else {
+    //    fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
+    //            getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
+    //}
+    //fflush(MemStatsLayer_outFile);
 }
 
 static void removeAllocation(AllocType allocType, uint64_t memSize, void* ptr) {
     scoped_lock l(globalFileMutex);
-    fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
-            getTimeStamp(), int(allocType), memSize, ptr);
-    fflush(MemStatsLayer_outFile);
-    fflush(MemStatsLayer_outFile);
+    //fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+    //        getTimeStamp(), int(allocType), memSize, ptr);
+    //fflush(MemStatsLayer_outFile);
 }
 
 
@@ -519,31 +522,35 @@ extern "C" {
 LPVOID (WINAPI* Real_HeapAlloc)(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) = HeapAlloc;
 BOOL (WINAPI* Real_HeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) = HeapFree;
 
-LPVOID WINAPI Mine_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) {
+LPVOID WINAPI MemStatsLayer_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwBytes) {
     LPVOID ptr = Real_HeapAlloc(hHeap, dwFlags, dwBytes);
-    if (!ptr) {
+    if (!ptr || hooked_alloc) {
         return ptr;
     }
 
     scoped_lock l(globalWinAllocMutex);
+    hooked_alloc = true;
     ht_insert(cpuAllocations, &ptr, &dwBytes);
     addAllocation(AllocType::CPU, uint64_t(dwBytes), (void*)ptr, 0);
+    hooked_alloc = false;
 
     return ptr;
 }
 
-BOOL WINAPI Mine_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
+BOOL WINAPI MemStatsLayer_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
     BOOL retVal = Real_HeapFree(hHeap, dwFlags, lpMem);
-    if (!retVal) {
+    if (!retVal || hooked_alloc) {
         return retVal;
     }
 
     scoped_lock l(globalWinAllocMutex);
+    hooked_alloc = true;
     if (ht_contains(cpuAllocations, &lpMem)) {
         size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
         removeAllocation(AllocType::CPU, size, (void*)lpMem);
         ht_erase(cpuAllocations, &lpMem);
     }
+    hooked_alloc = false;
 
     return retVal;
 }
@@ -558,40 +565,45 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
     }
 
     if (dwReason == DLL_PROCESS_ATTACH) {
+        cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
+        ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
+        MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
+
         DetourRestoreAfterWith();
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
         DetourAttach(&(PVOID&)HeapAlloc, MemStatsLayer_HeapAlloc);
         DetourAttach(&(PVOID&)HeapFree, MemStatsLayer_HeapFree);
         DetourTransactionCommit();
-        ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
-        MemStatsLayer_outFile = fopen("memstats.csv", "w");
-        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
     } else if (dwReason == DLL_PROCESS_DETACH) {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
         DetourDetach(&(PVOID&)HeapAlloc, MemStatsLayer_HeapAlloc);
         DetourDetach(&(PVOID&)HeapFree, MemStatsLayer_HeapFree);
         DetourTransactionCommit();
+
+        ht_clear(cpuAllocations);
+        ht_destroy(cpuAllocations);
         fclose(MemStatsLayer_outFile);
     }
 #elif defined(USE_MINHOOK)
-    if (DetourIsHelperProcess()) {
-        return TRUE;
-    }
-
     if (dwReason == DLL_PROCESS_ATTACH) {
+        cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
+        ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
+        MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
+
         MH_Initialize();
         MH_CreateHook(&HeapAlloc, &MemStatsLayer_HeapAlloc, reinterpret_cast<LPVOID*>(&Real_HeapAlloc));
         MH_CreateHook(&HeapFree, &MemStatsLayer_HeapFree, reinterpret_cast<LPVOID*>(&Real_HeapFree));
         MH_EnableHook(&HeapFree);
         MH_EnableHook(&HeapAlloc);
-        MemStatsLayer_outFile = fopen("memstats.csv", "w");
-        MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_DisableHook(&HeapAlloc);
         MH_DisableHook(&HeapFree);
         MH_Uninitialize();
+
         ht_clear(cpuAllocations);
         ht_destroy(cpuAllocations);
         fclose(MemStatsLayer_outFile);

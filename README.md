@@ -70,7 +70,6 @@ set VK_LOADER_LAYERS_ENABLE=*memstats
 ```shell
 $env:VK_ADD_LAYER_PATH = "<...>"
 $env:VK_LOADER_LAYERS_ENABLE = "*memstats"
-$env:VK_VSYNC = "off"
 ```
 
 
