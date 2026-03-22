@@ -985,7 +985,7 @@ void* malloc(size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_malloc(size);
-    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || !MemStatsLayer_outFile || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
@@ -1001,7 +1001,7 @@ void free(void* ptr) {
         MemStatsLayer_memtrace_init();
     }
     real_free(ptr);
-    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || !MemStatsLayer_outFile || MemStatsLayer_pid != getpid()) {
         return;
     }
 
@@ -1015,7 +1015,7 @@ void* calloc(size_t num, size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_calloc(num, size);
-    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || !MemStatsLayer_outFile || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
@@ -1031,7 +1031,7 @@ void* realloc(void* ptr, size_t new_size) {
         MemStatsLayer_memtrace_init();
     }
     void* new_ptr = real_realloc(ptr, new_size);
-    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || !MemStatsLayer_outFile || MemStatsLayer_pid != getpid()) {
         return new_ptr;
     }
 

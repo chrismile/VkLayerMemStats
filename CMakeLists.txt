@@ -138,13 +138,11 @@ if (${IS_MULTI_CONFIG})
             "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_memstats.json"
             "$<TARGET_FILE_DIR:VkLayer_memstats>")
 endif()
-if (NOT WIN32)
-    if (${IS_MULTI_CONFIG})
-        add_custom_command(TARGET VkLayer_memstats
-                POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/preload.sh"
-                "$<TARGET_FILE_DIR:VkLayer_memstats>")
-    endif()
+if (NOT WIN32 AND ${HOOK_MALLOC})
+    add_custom_command(TARGET VkLayer_memstats
+            POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/preload.sh"
+            "$<TARGET_FILE_DIR:VkLayer_memstats>")
 endif()
 
 install(
