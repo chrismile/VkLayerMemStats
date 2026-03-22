@@ -32,7 +32,6 @@
 
 #include <iostream>
 #include <map>
-#include <unordered_map>
 #include <chrono>
 #include <fstream>
 #include <atomic>
@@ -45,15 +44,14 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/utility/vk_dispatch_table.h>
 #include <vulkan/layer/vk_layer_settings.h>
-#include <vulkan/layer/vk_layer_settings.hpp>
 
 #ifdef HOOK_MALLOC
-extern "C" {
-#include <hashtable/hashtable.h>
-}
-
 #ifdef _WIN32
+
+#include <cstdarg>
 #include <windows.h>
+#include <strsafe.h>
+
 #ifdef USE_DETOURS
 // https://github.com/microsoft/Detours
 #include <detours.h>
@@ -61,10 +59,13 @@ extern "C" {
 // https://github.com/TsudaKageyu/minhook
 #include <MinHook.h>
 #endif
-#else // !defined(_WIN32)
+
+#else // defined(HOOK_MALLOC) && !defined(_WIN32)
+
 #include <cstdio>
 #include <dlfcn.h>
 #include <unistd.h>
+
 #endif
 #endif
 
@@ -82,28 +83,16 @@ void* getDispatchKey(DispatchT inst) {
     return *reinterpret_cast<void**>(inst);
 }
 
-/// Stores active memory allocations for a Vulkan device.
-struct DeviceMemInfo {
-    std::unordered_map<VkDeviceMemory, VkDeviceSize> allocatedMemoryBlocks;
-};
-
 // Instance and device dispatch tables and settings.
 static std::map<void*, VkuInstanceDispatchTable> instanceDispatchTables;
 static std::map<void*, VkuDeviceDispatchTable> deviceDispatchTables;
-static std::map<void*, std::shared_ptr<DeviceMemInfo>> deviceMemInfos;
-
-#ifdef HOOK_MALLOC
-static HashTable* cpuAllocations = nullptr;
-#endif
 
 /**
  * Global lock for access to the maps above.
- * Theoretically, we could switch to vku::concurrent::unordered_map, but this is likely not a performance bottleneck.
  */
 static std::mutex globalMutex;
-static std::mutex globalAllocMutex;
 typedef std::lock_guard<std::mutex> scoped_lock;
-// Cannot use static; https://stackoverflow.com/questions/12463718/linux-equivalent-of-dllmain
+// May not be able to use static; https://stackoverflow.com/questions/12463718/linux-equivalent-of-dllmain
 std::chrono::high_resolution_clock::time_point MemStatsLayer_startTime;
 FILE* MemStatsLayer_outFile;
 
@@ -111,19 +100,21 @@ FILE* MemStatsLayer_outFile;
 std::atomic<int> MemStatsLayer_refcount = 0;
 #endif
 
+// Global mutex for access to allocator and file output.
 #ifdef _WIN32
-static std::mutex allocMutex;
+static std::mutex globalAllocMutex;
 #else
-static pthread_mutex_t allocMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t globalAllocMutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 #ifdef HOOK_MALLOC
 
+// Whether hooked alloc is in use and we should forward internal allocs to CRT (used on Linux only due to limitations).
 static bool hooked_alloc = false;
 
 #ifdef _WIN32
-#define ACQUIRE_ALLOC() allocMutex.lock(); hooked_alloc = true;
-#define RELEASE_ALLOC() hooked_alloc = false; allocMutex.unlock();
+#define ACQUIRE_ALLOC() globalAllocMutex.lock(); hooked_alloc = true;
+#define RELEASE_ALLOC() hooked_alloc = false; globalAllocMutex.unlock();
 #else
 #define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex); hooked_alloc = true;
 #define RELEASE_ALLOC() hooked_alloc = false; pthread_mutex_unlock(&mutex);
@@ -132,8 +123,8 @@ static bool hooked_alloc = false;
 #else // !defined(HOOK_MALLOC)
 
 #ifdef _WIN32
-#define ACQUIRE_ALLOC() allocMutex.lock();
-#define RELEASE_ALLOC() allocMutex.unlock();
+#define ACQUIRE_ALLOC() globalAllocMutex.lock();
+#define RELEASE_ALLOC() globalAllocMutex.unlock();
 #else
 #define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex);
 #define RELEASE_ALLOC() pthread_mutex_unlock(&mutex);
@@ -145,6 +136,7 @@ static bool hooked_alloc = false;
 pid_t MemStatsLayer_pid = 0;
 #endif
 
+/// @return Elapsed time since application start in nanoseconds.
 uint64_t getTimeStamp() {
     auto now = std::chrono::high_resolution_clock::now();
     auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(now - MemStatsLayer_startTime).count();
@@ -156,21 +148,121 @@ enum class AllocType {
     CPU = 0, GPU = 1
 };
 
+#if defined(_WIN32) && defined(HOOK_MALLOC)
+/**
+ * The MSVC CRT seems to have a heap lock in the debug libraries.
+ * This means that a deadlock will occur when calling the "malloc" or "new" in the hooked memory allocation functions.
+ * fprintf may do dynamic memory allocations. So replace this with stack-only allocations on Windows.
+ * - vsnprintf and StringCbVPrintfExA are not an option, as it does CRT allocations.
+ * - wvsprintfA is not an option, as it is heavily limited (missing certain format types.
+ * So, we reimplement vsnprintf with support for the following formats:
+ * - %s: String
+ * - %c: Char
+ * - %d: Signed int
+ * - %u: Unsigned int
+ * - %llu: Unsigned 64-bit int
+ * - %p: Pointer (assumes 64-bit pointer size)
+ * Further reads on Windows heap allocation handling for those interested:
+ * - https://docs.microsoft.com/en-us/windows/win32/memory/heap-functions
+ * - https://learn.microsoft.com/en-us/windows/win32/memory/comparing-memory-allocation-methods
+ * - For debug, we could use: https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/crtsetallochook?view=msvc-170
+ * - One person at least seems to also have successfully hooked new/malloc/delete/free:
+ *   https://stackoverflow.com/questions/59579670/why-hooking-heapfree-with-detours-not-working-for-delete-free
+ * - In case we ever would need to reimplement itoa as well (luckily seems to not be necessary), we could use
+ *   https://gist.github.com/7h3w4lk3r/3f0ac29713b11ad01c8cd2894550d2c9 as a reference.
+ */
+static void fprintf_save(FILE* stream, const char* format, ...) {
+    static_assert(sizeof(void*) == sizeof(uint64_t));
+
+    char buffer[4096];
+    char temp[32]; // largest uint64 value has 21 digits (+ some spare space for hex, sign, ...)
+    int fmtPos = 0, bufPos = 0;
+
+    va_list vlist;
+    va_start(vlist, format);
+    while (format[fmtPos] != '\0' && bufPos < sizeof(buffer)) {
+        if (format[fmtPos] == '%') {
+            fmtPos++;
+            if (format[fmtPos] == 's') {
+                // String
+                const char* str = va_arg(vlist, const char*);
+                while (*str != '\0' && bufPos < sizeof(buffer)) {
+                    buffer[bufPos++] = *str++;
+                }
+            } else if (format[fmtPos] == 'c') {
+                // Char
+                buffer[bufPos++] = static_cast<char>(va_arg(vlist, int));
+            } else if (format[fmtPos] == 'd') {
+                // Signed integer
+                int num = va_arg(vlist, int);
+                _itoa_s(num, temp, _countof(temp), 10);
+                for (int i = 0; temp[i] != 0 && bufPos < sizeof(buffer); i++) {
+                    buffer[bufPos++] = temp[i];
+                }
+            } else if (format[fmtPos] == 'u') {
+                // Unsigned 32-bit integer
+                unsigned long num = va_arg(vlist, unsigned long);
+                _ultoa_s(num, temp, _countof(temp), 10);
+                for (int i = 0; temp[i] != 0 && bufPos < sizeof(buffer); i++) {
+                    buffer[bufPos++] = temp[i];
+                }
+            } else if (format[fmtPos] == 'l' && format[fmtPos + 1] == 'l' && format[fmtPos + 2] == 'u') {
+                // Unsigned 64-bit integer
+                fmtPos += 2;
+                uint64_t num = va_arg(vlist, uint64_t);
+                _ui64toa_s(num, temp, _countof(temp), 10);
+                for (int i = 0; temp[i] != 0 && bufPos < sizeof(buffer); i++) {
+                    buffer[bufPos++] = temp[i];
+                }
+            } else if (format[fmtPos] == 'p') {
+                // Pointer
+                void* ptr = va_arg(vlist, void*);
+                buffer[bufPos++] = '0';
+                if (bufPos < sizeof(buffer)) {
+                    buffer[bufPos++] = 'x';
+                }
+                _ui64toa_s(reinterpret_cast<uint64_t>(ptr), temp, _countof(temp), 16);
+                for (int i = 0; temp[i] != 0 && bufPos < sizeof(buffer); i++) {
+                    buffer[bufPos++] = temp[i];
+                }
+            } else {
+                // Attempt to pass through unsupported data type formats.
+                buffer[bufPos++] = '%';
+                if (bufPos < sizeof(buffer)) {
+                    buffer[bufPos++] = format[fmtPos];
+                }
+            }
+        } else {
+            buffer[bufPos++] = format[fmtPos];
+        }
+        fmtPos++;
+    }
+    va_end(vlist);
+
+    // Seems to not allocate heap memory via the CRT, but otherwise we could try the WinAPI function WriteFile.
+    fwrite(buffer, 1, bufPos, stream);
+}
+#else
+/**
+ * On Linux, there is no global heap lock (unlike Windows).
+ * We can use "hooked_alloc" to forward internal allocations directly to the original functions.
+ * Still, in the long run, it may also make sense to avoid heap memory allocations and use the Windows function above.
+ */
+#define fprintf_save fprintf
+#endif
+
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     if (allocType == AllocType::CPU) {
-        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
+        fprintf_save(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
                 getTimeStamp(), int(allocType), memSize, ptr);
     } else {
-        fprintf(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
+        fprintf_save(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p,%u\n",
                 getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
     }
-    //fflush(MemStatsLayer_outFile);
 }
 
-static void removeAllocation(AllocType allocType, uint64_t memSize, void* ptr) {
-    fprintf(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
-            getTimeStamp(), int(allocType), memSize, ptr);
-    //fflush(MemStatsLayer_outFile);
+static void removeAllocation(AllocType allocType, void* ptr) {
+    fprintf_save(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,%p\n", getTimeStamp(), int(allocType), ptr);
 }
 
 
@@ -181,8 +273,14 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EnumerateInstanceLa
     }
 
     if (pProperties) {
+#define LAYER_DESC "Memory usage statistics layer - https://github.com/chrismile/VkLayerMemStats"
+#ifdef _WIN32
+        strcpy_s(pProperties->layerName, VK_LAYER_NAME);
+        strcpy_s(pProperties->description, LAYER_DESC);
+#else
         strcpy(pProperties->layerName, VK_LAYER_NAME);
-        strcpy(pProperties->description, "Memory usage statistics layer - https://github.com/chrismile/VkLayerMemStats");
+        strcpy(pProperties->description, LAYER_DESC);
+#endif
         pProperties->implementationVersion = 1;
         pProperties->specVersion = VK_MAKE_API_VERSION(0, 1, 3, 234);
     }
@@ -337,16 +435,16 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        fprintf(MemStatsLayer_outFile, "devinfo,%" PRIu64 ",%u,%s\n",
+        fprintf_save(MemStatsLayer_outFile, "devinfo,%" PRIu64 ",%u,%s\n",
                 getTimeStamp(), uint32_t(deviceProperties.deviceType), deviceProperties.deviceName);
         for (uint32_t heapIdx = 0; heapIdx < deviceMemoryProperties.memoryHeapCount; heapIdx++) {
             auto& memHeap = deviceMemoryProperties.memoryHeaps[heapIdx];
-            fprintf(MemStatsLayer_outFile, "memheap,%" PRIu64 ",%u,%" PRIu64 ",%u\n",
+            fprintf_save(MemStatsLayer_outFile, "memheap,%" PRIu64 ",%u,%" PRIu64 ",%u\n",
                     getTimeStamp(), heapIdx, uint64_t(memHeap.size), uint32_t(memHeap.flags));
         }
         for (uint32_t memoryTypeIdx = 0; memoryTypeIdx < deviceMemoryProperties.memoryTypeCount; memoryTypeIdx++) {
             auto& memType = deviceMemoryProperties.memoryTypes[memoryTypeIdx];
-            fprintf(MemStatsLayer_outFile, "memtype,%" PRIu64 ",%u,%u,%u\n",
+            fprintf_save(MemStatsLayer_outFile, "memtype,%" PRIu64 ",%u,%u,%u\n",
                     getTimeStamp(), memoryTypeIdx, memType.heapIndex, uint32_t(memType.propertyFlags));
         }
     }
@@ -355,7 +453,6 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     {
         scoped_lock l(globalMutex);
         deviceDispatchTables[getDispatchKey(*pDevice)] = dispatchTable;
-        deviceMemInfos[getDispatchKey(*pDevice)] = std::make_shared<DeviceMemInfo>();
     }
     return VK_SUCCESS;
 }
@@ -364,7 +461,6 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
         VkDevice device, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
     deviceDispatchTables.erase(getDispatchKey(device));
-    deviceMemInfos.erase(getDispatchKey(device));
 }
 
 
@@ -385,8 +481,6 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AllocateMemory(
     {
         addAllocation(AllocType::GPU, pAllocateInfo->allocationSize, *pMemory, pAllocateInfo->memoryTypeIndex);
     }
-    auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
-    allocatedMemoryBlocks.insert(std::make_pair(*pMemory, pAllocateInfo->allocationSize));
     RELEASE_ALLOC();
 
     return res;
@@ -397,19 +491,12 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_FreeMemory(
     scoped_lock l(globalMutex);
 
     ACQUIRE_ALLOC();
-    auto& allocatedMemoryBlocks = deviceMemInfos[getDispatchKey(device)]->allocatedMemoryBlocks;
-    auto it = allocatedMemoryBlocks.find(memory);
-    if (it == allocatedMemoryBlocks.end()) {
-        return;
-    }
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        removeAllocation(AllocType::GPU, it->second, memory);
+        removeAllocation(AllocType::GPU, memory);
     }
-    allocatedMemoryBlocks.erase(it);
-    it = {};
     RELEASE_ALLOC();
 
     deviceDispatchTables[getDispatchKey(device)].FreeMemory(device, memory, pAllocator);
@@ -429,7 +516,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        fprintf(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", getTimeStamp());
+        fprintf_save(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", getTimeStamp());
     }
     RELEASE_ALLOC();
 
@@ -453,7 +540,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AcquireNextImageKHR
     if (getpid() == MemStatsLayer_pid)
 #endif
     {
-        fprintf(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
+        fprintf_save(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
     }
     RELEASE_ALLOC();
 
@@ -506,8 +593,6 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
 
 #if defined(_WIN32) && defined(HOOK_MALLOC)
 
-static std::mutex globalWinAllocMutex;
-
 extern "C" {
 
 // https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc
@@ -524,7 +609,6 @@ LPVOID WINAPI MemStatsLayer_HeapAlloc(HANDLE hHeap, DWORD dwFlags, DWORD_PTR dwB
     }
 
     ACQUIRE_ALLOC();
-    ht_insert(cpuAllocations, &ptr, &dwBytes);
     addAllocation(AllocType::CPU, uint64_t(dwBytes), (void*)ptr, 0);
     RELEASE_ALLOC();
 
@@ -538,11 +622,7 @@ BOOL WINAPI MemStatsLayer_HeapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
     }
 
     ACQUIRE_ALLOC();
-    if (ht_contains(cpuAllocations, &lpMem)) {
-        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
-        removeAllocation(AllocType::CPU, size, (void*)lpMem);
-        ht_erase(cpuAllocations, &lpMem);
-    }
+    removeAllocation(AllocType::CPU, (void*)lpMem);
     RELEASE_ALLOC();
 
     return retVal;
@@ -556,12 +636,7 @@ LPVOID WINAPI MemStatsLayer_HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMe
 
     ACQUIRE_ALLOC();
     auto new_size = uint64_t(dwBytes);
-    if (ht_contains(cpuAllocations, &lpMem)) {
-        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &lpMem);
-        removeAllocation(AllocType::CPU, size, lpMem);
-        ht_erase(cpuAllocations, &lpMem);
-    }
-    ht_insert(cpuAllocations, &new_ptr, &new_size);
+    removeAllocation(AllocType::CPU, lpMem);
     addAllocation(AllocType::CPU, new_size, new_ptr, 0);
     RELEASE_ALLOC();
 
@@ -578,9 +653,9 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
     }
 
     if (dwReason == DLL_PROCESS_ATTACH) {
-        cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
-        ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
-        MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        if (fopen_s(&MemStatsLayer_outFile, "memstats.csv", "w") != 0) {
+            throw std::runtime_error("File memstats.csv could not be opened for writing.");
+        }
         MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
 
         DetourRestoreAfterWith();
@@ -598,15 +673,14 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         DetourDetach(&(PVOID&)Real_HeapReAlloc, MemStatsLayer_HeapReAlloc);
         DetourTransactionCommit();
 
-        ht_clear(cpuAllocations);
-        ht_destroy(cpuAllocations);
         fclose(MemStatsLayer_outFile);
     }
 #elif defined(USE_MINHOOK)
     if (dwReason == DLL_PROCESS_ATTACH) {
-        cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
-        ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
-        MemStatsLayer_outFile = fopen("memstats.csv", "w");
+        if (fopen_s(&MemStatsLayer_outFile, "memstats.csv", "w") != 0) {
+            throw std::runtime_error("File memstats.csv could not be opened for writing.");
+        }
+
         MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
 
         MH_Initialize();
@@ -622,8 +696,6 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         MH_DisableHook(&Real_HeapReAlloc);
         MH_Uninitialize();
 
-        ht_clear(cpuAllocations);
-        ht_destroy(cpuAllocations);
         fclose(MemStatsLayer_outFile);
     }
 #endif
@@ -651,7 +723,7 @@ static realloc_type real_realloc = nullptr;
 
 #define CHECK_DLSYM(f) \
     if (!real_##f) { \
-        fprintf(stderr, "Error in dlsym: %s\n", dlerror()); \
+        fprintf_save(stderr, "Error in dlsym: %s\n", dlerror()); \
     }
 
 static void MemStatsLayer_memtrace_init() {
@@ -672,8 +744,6 @@ static void MemStatsLayer_memtrace_init() {
 
     MemStatsLayer_outFile = fopen("memstats.csv", "w");
     MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
-    cpuAllocations = reinterpret_cast<HashTable*>(malloc(sizeof(HashTable)));
-    ht_setup(cpuAllocations, sizeof(size_t), sizeof(void*), 4096);
 
     RELEASE_ALLOC();
 }
@@ -697,10 +767,6 @@ __attribute__((destructor)) void MemStatsLayer_OnFree() {
     if (MemStatsLayer_outFile) {
         ACQUIRE_ALLOC();
 
-        ht_clear(cpuAllocations);
-        ht_destroy(cpuAllocations);
-        free(cpuAllocations);
-        cpuAllocations = nullptr;
         fclose(MemStatsLayer_outFile);
         MemStatsLayer_outFile = nullptr;
 
@@ -715,12 +781,11 @@ void* malloc(size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_malloc(size);
-    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
     ACQUIRE_ALLOC();
-    ht_insert(cpuAllocations, &ptr, &size);
     addAllocation(AllocType::CPU, uint64_t(size), ptr, 0);
     RELEASE_ALLOC();
 
@@ -732,16 +797,12 @@ void free(void* ptr) {
         MemStatsLayer_memtrace_init();
     }
     real_free(ptr);
-    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
         return;
     }
 
     ACQUIRE_ALLOC();
-    if (ht_contains(cpuAllocations, &ptr)) {
-        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
-        removeAllocation(AllocType::CPU, size, ptr);
-        ht_erase(cpuAllocations, &ptr);
-    }
+    removeAllocation(AllocType::CPU, ptr);
     RELEASE_ALLOC();
 }
 
@@ -750,13 +811,11 @@ void* calloc(size_t num, size_t size) {
         MemStatsLayer_memtrace_init();
     }
     void* ptr = real_calloc(num, size);
-    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
         return ptr;
     }
 
     ACQUIRE_ALLOC();
-    size_t total_size = num * size;
-    ht_insert(cpuAllocations, &ptr, &total_size);
     addAllocation(AllocType::CPU, uint64_t(num * size), ptr, 0);
     RELEASE_ALLOC();
 
@@ -768,17 +827,12 @@ void* realloc(void* ptr, size_t new_size) {
         MemStatsLayer_memtrace_init();
     }
     void* new_ptr = real_realloc(ptr, new_size);
-    if (hooked_alloc || !cpuAllocations || MemStatsLayer_pid != getpid()) {
+    if (hooked_alloc || MemStatsLayer_pid != getpid()) {
         return new_ptr;
     }
 
     ACQUIRE_ALLOC();
-    if (ht_contains(cpuAllocations, &ptr)) {
-        size_t size = HT_LOOKUP_AS(size_t, cpuAllocations, &ptr);
-        removeAllocation(AllocType::CPU, size, ptr);
-        ht_erase(cpuAllocations, &ptr);
-    }
-    ht_insert(cpuAllocations, &new_ptr, &new_size);
+    removeAllocation(AllocType::CPU, ptr);
     addAllocation(AllocType::CPU, uint64_t(new_size), new_ptr, 0);
     RELEASE_ALLOC();
 

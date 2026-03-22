@@ -108,7 +108,7 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
   Optional entries: Memory type index (only for GPU)
 - An entry starting with `free` denotes a memory deallocation.
-  Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
+  Additional entries: Type (CPU = 0, GPU = 1), pointer
 - An entry starting with `devinfo` is written when a new Vulkan device is created.
   Additional entries: Device type (VkPhysicalDeviceType), device name
 - An entry starting with `memheap` is written when a new Vulkan device is created.
@@ -117,3 +117,11 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Type index, heap index, property flags
 - An entry starting with `submit` is written when `vkQueueSubmit` is called. 
 - An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called. 
+
+
+# Future considerations
+
+- We could use similar code like https://stackoverflow.com/questions/69838353/heapalloc-hooking-with-minihook-deadlock-on-windows-10-works-on-windows-7
+  to also log the name of the DLL that makes a CPU memory allocation (e.g., to separate application and driver).
+- Supply Windows executable for achieving similar effect as `LD_PRELOAD` on Linux.
+  See: https://github.com/microsoft/detours/wiki/SampleWithdll, https://github.com/microsoft/detours/wiki/DetourCreateProcessWithDlls
