@@ -85,6 +85,7 @@ void* getDispatchKey(DispatchT inst) {
 
 // Instance and device dispatch tables and settings.
 static std::map<void*, VkuInstanceDispatchTable> instanceDispatchTables;
+static std::map<void*, VkInstance> instances;
 static std::map<void*, VkuDeviceDispatchTable> deviceDispatchTables;
 
 /**
@@ -361,6 +362,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateInstance(
     {
         scoped_lock l(globalMutex);
         instanceDispatchTables[getDispatchKey(*pInstance)] = dispatchTable;
+        instances[getDispatchKey(*pInstance)] = *pInstance;
 #ifndef HOOK_MALLOC
         if (MemStatsLayer_refcount == 0) {
             MemStatsLayer_outFile = fopen("memstats.csv", "w");
@@ -376,6 +378,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyInstance(
         VkInstance instance, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
     instanceDispatchTables.erase(getDispatchKey(instance));
+    instances.erase(getDispatchKey(instance));
 #ifndef HOOK_MALLOC
     --MemStatsLayer_refcount;
     if (MemStatsLayer_refcount == 0) {
@@ -407,6 +410,23 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     // Advance the chain for passing to the next layer and create the device.
     createInfoChain->u.pLayerInfo = createInfoChain->u.pLayerInfo->pNext;
     auto pCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(pGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice"));
+	// The code below should fail due to the instance being a null handle according to
+	// https://docs.vulkan.org/refpages/latest/refpages/source/vkGetInstanceProcAddr.html, but for whatever reason,
+	// this works with my own Vulkan apps and only fails with Blender.
+    //auto pGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)pGetInstanceProcAddr(
+    //        VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
+    //auto pGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)pGetInstanceProcAddr(
+    //        VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    VkInstance instance{};
+    {
+        scoped_lock l(globalMutex);
+        instance = instances[getDispatchKey(physicalDevice)];
+    }
+    auto pGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)pGetInstanceProcAddr(
+            instance, "vkGetPhysicalDeviceProperties");
+    auto pGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)pGetInstanceProcAddr(
+            instance, "vkGetPhysicalDeviceMemoryProperties");
+
     VkResult result = pCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (result != VK_SUCCESS) {
         return result;
@@ -418,16 +438,20 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.DestroyDevice = (PFN_vkDestroyDevice)pGetDeviceProcAddr(*pDevice, "vkDestroyDevice");
     dispatchTable.AllocateMemory = (PFN_vkAllocateMemory)pGetDeviceProcAddr(*pDevice, "vkAllocateMemory");
     dispatchTable.FreeMemory = (PFN_vkFreeMemory)pGetDeviceProcAddr(*pDevice, "vkFreeMemory");
+    dispatchTable.BindBufferMemory = (PFN_vkBindBufferMemory)pGetDeviceProcAddr(*pDevice, "vkBindBufferMemory");
+    dispatchTable.BindImageMemory = (PFN_vkBindImageMemory)pGetDeviceProcAddr(*pDevice, "vkBindImageMemory");
+    dispatchTable.DestroyBuffer = (PFN_vkDestroyBuffer)pGetDeviceProcAddr(*pDevice, "vkDestroyBuffer");
+    dispatchTable.DestroyImage = (PFN_vkDestroyImage)pGetDeviceProcAddr(*pDevice, "vkDestroyImage");
+    dispatchTable.CmdCopyBuffer = (PFN_vkCmdCopyBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer");
+    dispatchTable.CmdCopyImage = (PFN_vkCmdCopyImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImage");
+    dispatchTable.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage");
+    dispatchTable.CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImageToBuffer");
     dispatchTable.QueueSubmit = (PFN_vkQueueSubmit)pGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
     dispatchTable.AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)pGetDeviceProcAddr(*pDevice, "vkAcquireNextImageKHR");
 
     // Write memory statistics.
     VkPhysicalDeviceProperties deviceProperties{};
     VkPhysicalDeviceMemoryProperties deviceMemoryProperties{};
-    auto pGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)pGetInstanceProcAddr(
-            VK_NULL_HANDLE, "vkGetPhysicalDeviceProperties");
-    auto pGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)pGetInstanceProcAddr(
-            VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
     pGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
     pGetPhysicalDeviceMemoryProperties(physicalDevice, &deviceMemoryProperties);
     ACQUIRE_ALLOC();
@@ -502,6 +526,170 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_FreeMemory(
     deviceDispatchTables[getDispatchKey(device)].FreeMemory(device, memory, pAllocator);
 }
 
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindBufferMemory(
+        VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+    scoped_lock l(globalMutex);
+
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "bind_buffer_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
+                getTimeStamp(), buffer, memory, memoryOffset);
+    }
+    RELEASE_ALLOC();
+
+    return deviceDispatchTables[getDispatchKey(device)].BindBufferMemory(device, buffer, memory, memoryOffset);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindImageMemory(
+        VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+    scoped_lock l(globalMutex);
+
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "bind_image_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
+                getTimeStamp(), image, memory, memoryOffset);
+    }
+    RELEASE_ALLOC();
+
+    return deviceDispatchTables[getDispatchKey(device)].BindImageMemory(device, image, memory, memoryOffset);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyBuffer(
+        VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator) {
+    scoped_lock l(globalMutex);
+
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(MemStatsLayer_outFile, "destroy_buffer,%" PRIu64 ",%p\n", getTimeStamp(), buffer);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(device)].DestroyBuffer(device, buffer, pAllocator);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyImage(
+        VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
+    scoped_lock l(globalMutex);
+
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(MemStatsLayer_outFile, "destroy_image,%" PRIu64 ",%p\n", getTimeStamp(), image);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(device)].DestroyImage(device, image, pAllocator);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer(
+        VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkBuffer dstBuffer, uint32_t regionCount,
+        const VkBufferCopy* pRegions) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        copySize += pRegions[i].size;
+    }
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+                getTimeStamp(), copySize, srcBuffer, dstBuffer);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBuffer(
+            commandBuffer, srcBuffer, dstBuffer, regionCount, pRegions);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImage(
+        VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage,
+        VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageCopy* pRegions) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        copySize += pRegions[i].extent.width * pRegions[i].extent.height * pRegions[i].extent.depth;
+    }
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+                getTimeStamp(), copySize, srcImage, dstImage);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImage(
+            commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBufferToImage(
+        VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage, VkImageLayout dstImageLayout,
+        uint32_t regionCount, const VkBufferImageCopy* pRegions) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        copySize += pRegions[i].imageExtent.width * pRegions[i].imageExtent.height * pRegions[i].imageExtent.depth;
+    }
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+                getTimeStamp(), copySize, srcBuffer, dstImage);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBufferToImage(
+            commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer(
+        VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkBuffer dstBuffer,
+        uint32_t regionCount, const VkBufferImageCopy* pRegions) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        copySize += pRegions[i].imageExtent.width * pRegions[i].imageExtent.height * pRegions[i].imageExtent.depth;
+    }
+    ACQUIRE_ALLOC();
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+    if (getpid() == MemStatsLayer_pid)
+#endif
+    {
+        fprintf_save(
+                MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+                getTimeStamp(), copySize, srcImage, dstBuffer);
+    }
+    RELEASE_ALLOC();
+
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer(
+            commandBuffer, srcImage, srcImageLayout, dstBuffer, regionCount, pRegions);
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
         VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
     scoped_lock l(globalMutex);
@@ -558,6 +746,14 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetDevice
     GETPROCADDR_VK(DestroyDevice);
     GETPROCADDR_VK(AllocateMemory);
     GETPROCADDR_VK(FreeMemory);
+    GETPROCADDR_VK(BindBufferMemory);
+    GETPROCADDR_VK(BindImageMemory);
+    GETPROCADDR_VK(DestroyBuffer);
+    GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(CmdCopyBuffer);
+    GETPROCADDR_VK(CmdCopyImage);
+    GETPROCADDR_VK(CmdCopyBufferToImage);
+    GETPROCADDR_VK(CmdCopyImageToBuffer);
     GETPROCADDR_VK(QueueSubmit);
     GETPROCADDR_VK(AcquireNextImageKHR);
 
@@ -581,6 +777,14 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
     GETPROCADDR_VK(DestroyDevice);
     GETPROCADDR_VK(AllocateMemory);
     GETPROCADDR_VK(FreeMemory);
+    GETPROCADDR_VK(BindBufferMemory);
+    GETPROCADDR_VK(BindImageMemory);
+    GETPROCADDR_VK(DestroyBuffer);
+    GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(CmdCopyBuffer);
+    GETPROCADDR_VK(CmdCopyImage);
+    GETPROCADDR_VK(CmdCopyBufferToImage);
+    GETPROCADDR_VK(CmdCopyImageToBuffer);
     GETPROCADDR_VK(QueueSubmit);
     GETPROCADDR_VK(AcquireNextImageKHR);
 

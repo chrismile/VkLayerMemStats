@@ -2,8 +2,8 @@
 
 A Vulkan layer for dumping memory statistics.
 
-When using the layer, memory statistics will be dumped to a file memstats.csv. The layer can either only dump Vulkan
-memory allocations, or also CPU memory allocations (see "CPU memory allocation hooking").
+When using the layer, memory statistics will be dumped to a file called memstats.csv. The layer can either only dump
+Vulkan memory statistics, or also CPU memory allocations.
 
 
 ## How to build
@@ -20,8 +20,14 @@ cmake -B build -S .
 cmake --build build --config Release -j 8
 ```
 
+To further enable CPU memory allocation statistics dumping, append the options below to the CMake configure step.
+- Linux: Append `-DHOOK_MALLOC=ON` to hook `malloc`/`free`/`calloc`/`realloc`.
+- Windows (recommended): Append `-DUSE_DETOURS=ON` to use [Detours](https://github.com/microsoft/Detours).
+  This is the recommended option for Windows, as a preload helper executable is provided for Detours, but not MinHook.
+- Windows (alternative): Append `-DUSE_MINHOOK=ON` to use [MinHook](https://github.com/TsudaKageyu/minhook).
 
-## Usage on Linux
+
+## Usage on Linux (Vulkan-only)
 
 Vulkan changed how layer configuration works for loaders built against the 1.3.234 Vulkan headers or later.
 For more details, please refer to
@@ -29,14 +35,14 @@ https://github.com/KhronosGroup/Vulkan-Utility-Libraries/blob/main/docs/layer_co
 If using a recent Vulkan loader, the environment variables below can be used to enable the layer.
 
 ```shell
-export VK_ADD_LAYER_PATH=$(pwd)/build
+export VK_ADD_LAYER_PATH=<PATH_TO_BUILD>
 export VK_LOADER_LAYERS_ENABLE=*memstats
 ```
 
 For older Vulkan loaders, please use the deprecated `VK_INSTANCE_LAYERS` variable.
 
 ```shell
-export VK_ADD_LAYER_PATH=$(pwd)/build
+export VK_ADD_LAYER_PATH=<PATH_TO_BUILD>
 export VK_INSTANCE_LAYERS=VK_LAYER_CHRISMILE_memstats
 ```
 
@@ -46,7 +52,7 @@ If the layer should be installed globally, please add the following arguments to
 Independent of the operating system, `--target install` needs to be added to `cmake --build build` in this case as well.
 
 
-## Usage on Windows
+## Usage on Windows (Vulkan-only)
 
 The usage on Windows is the same as on Linux, but depending on the used terminal (cmd.exe/PowerShell/MSYS2).
 Examples are given below.
@@ -54,49 +60,62 @@ Examples are given below.
 ### MSYS2 (bash)
 
 ```shell
-export VK_ADD_LAYER_PATH=<...>
+export VK_ADD_LAYER_PATH=<PATH_TO_BUILD>
 export VK_LOADER_LAYERS_ENABLE=*memstats
 ```
 
 ### cmd.exe
 
 ```shell
-set VK_ADD_LAYER_PATH=<...>
+set VK_ADD_LAYER_PATH=<PATH_TO_BUILD>
 set VK_LOADER_LAYERS_ENABLE=*memstats
 ```
 
 ### PowerShell
 
 ```shell
-$env:VK_ADD_LAYER_PATH = "<...>"
+$env:VK_ADD_LAYER_PATH = "<PATH_TO_BUILD>"
 $env:VK_LOADER_LAYERS_ENABLE = "*memstats"
 ```
 
 
-## CPU memory allocation hooking
+## Usage on Linux (Vulkan & CPU)
 
-By default, the Vulkan layer will only dump statistics for Vulkan memory allocations.
-When configuring with the option `-DHOOK_MALLOC=ON`, CPU memory allocation functions will be hooked as well.
-Additionally, on Linux `LD_PRELOAD` needs to point to the Vulkan layer shared library, e.g.:
+In case the Vulkan layer was built with `-DHOOK_MALLOC=ON`, `LD_PRELOAD` needs to point to the layer shared library.
+
 ```shell
-export LD_PRELOAD=<PATH>/libVkLayer_memstats.so
-export VK_ADD_LAYER_PATH=<PATH>
+export LD_PRELOAD=<PATH_TO_BUILD>/libVkLayer_memstats.so
+export VK_ADD_LAYER_PATH=<PATH_TO_BUILD>
 export VK_LOADER_LAYERS_ENABLE=*memstats
 ```
 
-For more details on the malloc hooking mechanism on Linux, please refer to
+Alternatively, a script `preload.sh` is given in the build folder and binary distributions that can be used as a wrapper
+for launching applications with the Vulkan layer preloaded and the necessary environment variables set.
+
+```shell
+./preload.sh <application> <app_args...>
+```
+
+Please note that on Linux, preloading is **NOT** optional and not using `LD_PRELOAD` can lead to crashes when
+the Vulkan layer calls fprintf to write to the output file.
+For those interested in details on how the malloc hooking mechanism on Linux works, please refer to
 https://sourceware.org/glibc/manual/2.43/html_mono/libc.html#Replacing-malloc.
 
-On Windows, [Detours](https://github.com/microsoft/Detours) or [MinHook](https://github.com/TsudaKageyu/minhook)
-can be used for similarly hooking CPU memory allocations.
 
-Please note that during testing this on Linux, weird things happened when using malloc hooking together with Vulkan
-apps using DLSS. Calling `NVSDK_NGX_VULKAN_GetFeatureRequirements` caused the shared library constructor and destructor
-to be triggered two additional times.
+## Usage on Windows (Vulkan & CPU)
 
-Furthermore, please note that compiling with `-DHOOK_MALLOC=ON` and not using `LD_PRELOAD` will lead to crashes when
-the Vulkan layer calls fprintf to write to the output file.
+When building with `-DUSE_DETOURS=ON`, `preload.exe` and `withdll.exe` can be used to preload the Vulkan layer library
+at application startup. `withdll.exe` will only load the layer at app start for CPU memory allocation hooking, while
+`preload.exe` will additionally set both the `VK_ADD_LAYER_PATH` and `VK_LOADER_LAYERS_ENABLE` environment variable.
 
+```
+withdll.exe /d:"<PATH_TO_BUILD>/VkLayer_memstats.dll" <...>.exe
+preload.exe <...>.exe
+```
+
+During tests, and unlike for Linux, not preloading did not lead to crashes. However, in that case, CPU memory
+allocations and deallocations will only start to be tracked when the Vulkan loader loads the layer library.
+Please note that currently, the preloading application is not yet available with MinHook builds.
 
 ## File output format
 
@@ -115,14 +134,38 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Heap index, size in bytes, flags
 - An entry starting with `memtype` is written when a new Vulkan device is created.
   Additional entries: Type index, heap index, property flags
-- An entry starting with `submit` is written when `vkQueueSubmit` is called. 
-- An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called. 
+- An entry starting with `submit` is written when `vkQueueSubmit` is called.
+- An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called.
+- An entry starting with `bind_buffer_memory` is written when `vkBindBufferMemory` is called.
+  Additional entries: Buffer pointer, memory pointer, memory offset.
+- An entry starting with `bind_image_memory` is written when `vkBindImageMemory` is called.
+  Additional entries: Image pointer, memory pointer, memory offset.
+- An entry starting with `destroy_buffer` is written when `vkDestroyBuffer` is called.
+  Additional entries: Buffer pointer.
+- An entry starting with `destroy_image` is written when `vkDestroyImage` is called.
+  Additional entries: Image pointer.
+- An entry starting with `copy_buffer` is written when `vkCmdCopyBuffer` is called.
+  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+- An entry starting with `copy_image` is written when `vkCmdCopyImage` is called.
+  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+- An entry starting with `copy_buffer_to_image` is written when `vkCmdCopyBufferToImage` is called.
+  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+- An entry starting with `copy_image_to_buffer` is written when `vkCmdCopyImageToBuffer` is called.
+  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
 
 
 # Future considerations
 
-- We could use similar code like https://stackoverflow.com/questions/69838353/heapalloc-hooking-with-minihook-deadlock-on-windows-10-works-on-windows-7
+- We could use similar code like
+  https://stackoverflow.com/questions/69838353/heapalloc-hooking-with-minihook-deadlock-on-windows-10-works-on-windows-7
   to also log the name of the DLL that makes a CPU memory allocation (e.g., to separate application and driver).
-- Supply Windows executable for achieving similar effect as `LD_PRELOAD` on Linux.
-  See: https://github.com/microsoft/detours/wiki/SampleWithdll, https://github.com/microsoft/detours/wiki/DetourCreateProcessWithDlls
-- Capture memory copy operations in Vulkan (maybe also on CPU?).
+- Capture `memcpy` on the CPU.
+
+Examples for currently uncaptured Vulkan memory copy functionality (see
+https://docs.vulkan.org/spec/latest/chapters/copies.html as a reference):
+- Capture `vkCmdCopyMemoryKHR`, `vkCmdCopyMemoryToImageKHR`, `vkCmdCopyImageToMemoryKHR` (from
+  `VK_KHR_device_address_commands`).
+- `vkCmdCopyBuffer2`, `vkCmdCopyImage2` `vkCmdCopyBufferToImage2`, `vkCmdCopyImageToBuffer2` (from Vulkan 1.3 and
+  `VK_KHR_copy_commands2` for the KHR version).
+- `vkCopyMemoryToImage`, `vkCopyImageToMemory`, `vkCopyImageToImage` (from Vulkan 1.4 and `VK_EXT_host_image_copy` for
+  the EXT version).
