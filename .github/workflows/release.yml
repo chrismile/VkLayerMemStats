@@ -39,7 +39,7 @@ on:
     types: [created]
 
 permissions:
-    contents: write
+  contents: write
 
 jobs:
   generate:
@@ -52,11 +52,23 @@ jobs:
             target_name: x86_64-linux
             shell: bash
           - os: ubuntu-22.04
+            target_name: x86_64-linux-memhook
+            shell: bash
+          - os: ubuntu-22.04
             target_name: aarch64-linux
+            shell: bash
+          - os: ubuntu-22.04
+            target_name: aarch64-linux-memhook
             shell: bash
           # Windows targets.
           - os: windows-2022
             target_name: x86_64-windows
+            shell: 'bash -el {0}'
+          - os: windows-2022
+            target_name: x86_64-windows-detours
+            shell: 'bash -el {0}'
+          - os: windows-2022
+            target_name: x86_64-windows-minhook
             shell: 'bash -el {0}'
           - os: windows-2022
             target_name: x86_64-windows-gnu
@@ -95,10 +107,19 @@ jobs:
           if [ "${{ matrix.target_name }}" == "x86_64-windows-gnu" ]; then
               CMAKE_ARGS+=(-G "MSYS Makefiles")
           fi
-          if [ "$RUNNER_OS" == "Linux" ] && [ "${{ matrix.target_name }}" == "aarch64-linux" ]; then
+          if [ "$RUNNER_OS" == "Linux" ] && [ "${{ matrix.target_name }}" == "aarch64-linux"* ]; then
               sudo apt update
               sudo apt install -y g++-aarch64-linux-gnu libc6-dev-arm64-cross
               CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE="CMake/aarch64-linux-gnu.toolchain.cmake")
+          fi
+          if [ "${{ matrix.target_name }}" == *memhook ]; then
+              CMAKE_ARGS+=(-DHOOK_MALLOC=ON)
+          fi
+          if [ "${{ matrix.target_name }}" == *detours ]; then
+              CMAKE_ARGS+=(-DUSE_DETOURS=ON)
+          fi
+          if [ "${{ matrix.target_name }}" == *minhook ]; then
+              CMAKE_ARGS+=(-DUSE_MINHOOK=ON)
           fi
           cmake . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_STATIC_STD_LIBRARIES=ON ${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}
           cmake --build build --config Release
@@ -116,6 +137,14 @@ jobs:
               fi
           else
               cp "build/libVkLayer_memstats.so" "dist/"
+          fi
+          if [ "${{ matrix.target_name }}" == *detours ]; then
+              cp "build/Release/preload.exe" "dist/"
+              cp "build/Release/withdll.exe" "dist/"
+          fi
+          if [ "$RUNNER_OS" != "Windows" ]; then
+              cp "tools/preload.sh" "dist/"
+              chmod +x dist/preload.sh
           fi
           cp -r docs/license-libraries dist/docs/license-libraries
           cp README.md dist/docs

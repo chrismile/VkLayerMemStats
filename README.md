@@ -125,3 +125,4 @@ The first entry denotes the type of the record. The second entry is always a tim
   to also log the name of the DLL that makes a CPU memory allocation (e.g., to separate application and driver).
 - Supply Windows executable for achieving similar effect as `LD_PRELOAD` on Linux.
   See: https://github.com/microsoft/detours/wiki/SampleWithdll, https://github.com/microsoft/detours/wiki/DetourCreateProcessWithDlls
+- Capture memory copy operations in Vulkan (maybe also on CPU?).

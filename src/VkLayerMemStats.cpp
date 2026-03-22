@@ -28,7 +28,7 @@
  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+ */
 
 #include <iostream>
 #include <map>
@@ -116,8 +116,8 @@ static bool hooked_alloc = false;
 #define ACQUIRE_ALLOC() globalAllocMutex.lock(); hooked_alloc = true;
 #define RELEASE_ALLOC() hooked_alloc = false; globalAllocMutex.unlock();
 #else
-#define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex); hooked_alloc = true;
-#define RELEASE_ALLOC() hooked_alloc = false; pthread_mutex_unlock(&mutex);
+#define ACQUIRE_ALLOC() pthread_mutex_lock(&globalAllocMutex); hooked_alloc = true;
+#define RELEASE_ALLOC() hooked_alloc = false; pthread_mutex_unlock(&globalAllocMutex);
 #endif
 
 #else // !defined(HOOK_MALLOC)
@@ -126,8 +126,8 @@ static bool hooked_alloc = false;
 #define ACQUIRE_ALLOC() globalAllocMutex.lock();
 #define RELEASE_ALLOC() globalAllocMutex.unlock();
 #else
-#define ACQUIRE_ALLOC() pthread_mutex_lock(&mutex);
-#define RELEASE_ALLOC() pthread_mutex_unlock(&mutex);
+#define ACQUIRE_ALLOC() pthread_mutex_lock(&globalAllocMutex);
+#define RELEASE_ALLOC() pthread_mutex_unlock(&globalAllocMutex);
 #endif
 
 #endif

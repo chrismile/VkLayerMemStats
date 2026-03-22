@@ -13,15 +13,17 @@ endif()
 
 option(HOOK_MALLOC "Hook CPU memory allocation/deallocation." OFF)
 option(USE_STATIC_STD_LIBRARIES "Link with standard libraries statically." OFF)
-option(USE_DETOURS "Use Detours for CPU memory allocation/deallocation hooking (Windows only)." OFF)
-option(USE_MINHOOK "Use MinHook for CPU memory allocation/deallocation hooking (Windows only)." OFF)
+if (WIN32)
+    option(USE_DETOURS "Use Detours for CPU memory allocation/deallocation hooking (Windows only)." OFF)
+    option(USE_MINHOOK "Use MinHook for CPU memory allocation/deallocation hooking (Windows only)." OFF)
+endif()
 set(DATA_PATH "${CMAKE_SOURCE_DIR}/Data" CACHE PATH "Location of folder 'Data'")
 
 if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
     message(FATAL_ERROR "Error: Submodules are not cloned. Please call \"git submodule update --init --recursive\".")
 endif()
 
-file(GLOB_RECURSE SOURCES src/*.cpp src/*.c src/*.hpp src/*.h)
+list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/VkLayerMemStats.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings_helper.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/layer_settings_util.cpp")
@@ -41,6 +43,11 @@ if (${USE_STATIC_STD_LIBRARIES})
     endif()
 endif()
 
+if (WIN32)
+    if (${USE_DETOURS} OR ${USE_MINHOOK})
+        set(HOOK_MALLOC ON)
+    endif()
+endif()
 if (${HOOK_MALLOC})
     target_compile_definitions(VkLayer_memstats PRIVATE HOOK_MALLOC)
 endif()
@@ -76,6 +83,10 @@ if (WIN32 AND ${HOOK_MALLOC})
 
         add_executable(withdll "${detours_SOURCE_DIR}/samples/withdll/withdll.cpp")
         target_link_libraries(withdll PRIVATE detours)
+
+        add_executable(preload "${CMAKE_CURRENT_SOURCE_DIR}/src/DetoursPreload.cpp")
+        target_link_libraries(preload PRIVATE detours)
+        target_link_libraries(preload PRIVATE shlwapi)
     elseif (${USE_MINHOOK})
         FetchContent_Declare(
                 minhook
