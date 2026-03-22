@@ -138,6 +138,7 @@ jobs:
               cp "tools/preload.sh" "dist/"
               chmod +x dist/preload.sh
           fi
+          cp "build/VkLayer_memstats.json" "dist/"
           cp -r docs/license-libraries dist/docs/license-libraries
           cp README.md dist/docs
           cp LICENSE dist/docs
