@@ -5,6 +5,8 @@ A Vulkan layer for dumping memory statistics.
 When using the layer, memory statistics will be dumped to a file called memstats.csv. The layer can either only dump
 Vulkan memory statistics, or also CPU memory allocations.
 
+![Memory plot of Blender 5.1 startup](img/Mem_plot_Blender_5.1_startup.png)
+
 
 ## How to build
 
@@ -108,7 +110,7 @@ When building with `-DUSE_DETOURS=ON`, `preload.exe` and `withdll.exe` can be us
 at application startup. `withdll.exe` will only load the layer at app start for CPU memory allocation hooking, while
 `preload.exe` will additionally set both the `VK_ADD_LAYER_PATH` and `VK_LOADER_LAYERS_ENABLE` environment variable.
 
-```
+```shell
 withdll.exe /d:"<PATH_TO_BUILD>/VkLayer_memstats.dll" <...>.exe
 preload.exe <...>.exe
 ```
