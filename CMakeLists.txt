@@ -22,7 +22,6 @@ if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
 endif()
 
 file(GLOB_RECURSE SOURCES src/*.cpp src/*.c src/*.hpp src/*.h)
-list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hashtable/hashtable.c")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings_helper.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/layer_settings_util.cpp")
@@ -31,7 +30,6 @@ list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libr
 add_library(VkLayer_memstats SHARED ${SOURCES})
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Headers/include)
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Utility-Libraries/include)
-target_include_directories(VkLayer_memstats PRIVATE third_party/hashtable)
 target_include_directories(VkLayer_memstats PRIVATE third_party)
 
 if (${USE_STATIC_STD_LIBRARIES})
@@ -75,6 +73,9 @@ if (WIN32 AND ${HOOK_MALLOC})
         target_include_directories(detours PUBLIC "${detours_SOURCE_DIR}/src")
         target_compile_definitions(VkLayer_memstats PRIVATE USE_DETOURS)
         target_link_libraries(VkLayer_memstats PRIVATE detours)
+
+        add_executable(withdll "${detours_SOURCE_DIR}/samples/withdll/withdll.cpp")
+        target_link_libraries(withdll PRIVATE detours)
     elseif (${USE_MINHOOK})
         FetchContent_Declare(
                 minhook
