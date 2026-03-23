@@ -1,35 +1,40 @@
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Christoph Neuhauser
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
 import argparse
-from enum import IntEnum
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-
-
-# https://registry.khronos.org/VulkanSC/specs/1.0-extensions/man/html/VkMemoryPropertyFlagBits.html
-class MemoryProperty(IntEnum):
-    DEVICE_LOCAL_BIT = 0x00000001
-    HOST_VISIBLE_BIT = 0x00000002
-    HOST_COHERENT_BIT = 0x00000004
-    HOST_CACHED_BIT = 0x00000008
-    LAZILY_ALLOCATED_BIT = 0x00000010
-    PROTECTED_BIT = 0x00000020
-
-
-def convert_memory_property_flags_to_string(flags):
-    flags_list = []
-    if (flags & MemoryProperty.DEVICE_LOCAL_BIT) != 0:
-        flags_list.append('device local')
-    if (flags & MemoryProperty.HOST_VISIBLE_BIT) != 0:
-        flags_list.append('host visible')
-    if (flags & MemoryProperty.HOST_COHERENT_BIT) != 0:
-        flags_list.append('host coherent')
-    if (flags & MemoryProperty.HOST_CACHED_BIT) != 0:
-        flags_list.append('host cached')
-    if (flags & MemoryProperty.LAZILY_ALLOCATED_BIT) != 0:
-        flags_list.append('lazily allocated')
-    if (flags & MemoryProperty.PROTECTED_BIT) != 0:
-        flags_list.append('protected')
-    return ', '.join(flags_list)
+from memory_properties import MemoryProperty, convert_memory_property_flags_to_string
 
 
 def main():
@@ -42,7 +47,7 @@ def main():
     parser.add_argument('filename')
     parser.add_argument('--hide-gpu-allocations', action='store_true', default=False)
     parser.add_argument('--hide-cpu-allocations', action='store_true', default=False)
-    parser.add_argument('--show-submits', action='store_true', default=False)
+    parser.add_argument('--show-submits', action='store_true', default=True)
     parser.add_argument('--show-acquire', action='store_true', default=False)
     parser.add_argument('--show-memcpy-device-to-device', action='store_true', default=False)
     parser.add_argument('--show-memcpy-host-to-device', action='store_true', default=False)
@@ -175,17 +180,7 @@ def main():
                 buffer_dst_ptr = entries[4]
                 mem_type_src = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_src_ptr]]
                 mem_type_dst = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]
-                is_src_host_visible = (mem_type_src & MemoryProperty.HOST_VISIBLE_BIT) != 0
-                is_dst_host_visible = (mem_type_dst & MemoryProperty.HOST_VISIBLE_BIT) != 0
-                if not is_src_host_visible and not is_dst_host_visible:
-                    gpu_device_to_device_copy_timestamps.append(timestamp)
-                    gpu_device_to_device_copy_sizes.append(copy_size)
-                elif is_src_host_visible and not is_dst_host_visible:
-                    gpu_host_to_device_copy_timestamps.append(timestamp)
-                    gpu_host_to_device_copy_sizes.append(copy_size)
-                elif not is_src_host_visible and is_dst_host_visible:
-                    gpu_device_to_host_copy_timestamps.append(timestamp)
-                    gpu_device_to_host_copy_sizes.append(copy_size)
+                add_memcpy(copy_size, mem_type_src, mem_type_dst)
             elif entries[0] == 'copy_buffer_to_image':
                 copy_size = float(entries[2])
                 buffer_src_ptr = entries[3]
@@ -207,12 +202,12 @@ def main():
         mem_type_names.append(convert_memory_property_flags_to_string(flags))
 
     mem_points_cpu = np.asarray(mem_points_cpu)
-    max_num_mem = np.max(mem_points_cpu)
+    max_mem = np.max(mem_points_cpu)
     for mem_type_idx in range(num_gpu_mem_types):
         mem_points_gpu_types[mem_type_idx] = np.asarray(mem_points_gpu_types[mem_type_idx])
         if mem_points_gpu_types[mem_type_idx].shape[0] != 0:
-            max_num_mem = max(max_num_mem, np.max(mem_points_gpu_types[mem_type_idx]))
-    if max_num_mem > 1e9:
+            max_mem = max(max_mem, np.max(mem_points_gpu_types[mem_type_idx]))
+    if max_mem > 1e9:
         units_mem = 'GiB'
         scale_mem = 1e9
     else:
@@ -245,9 +240,9 @@ def main():
     if args.show_memcpy_device_to_host:
         plt.vlines(gpu_device_to_host_copy_timestamps, 0, gpu_device_to_host_copy_sizes, label='Device-to-host copy', colors='C2')
     if args.show_submits:
-        plt.vlines(submit_timestamps, 0, max_num_mem / scale_mem, label='Submit', colors='C0')
+        plt.vlines(submit_timestamps, 0, max_mem / scale_mem, label='Submit', colors='C0')
     if args.show_acquire:
-        plt.vlines(image_acquire_timestamps, 0, max_num_mem / scale_mem, label='Acquire image', colors='C1')
+        plt.vlines(image_acquire_timestamps, 0, max_mem / scale_mem, label='Acquire image', colors='C1')
     if args.frame_idx >= 0:
         plt.xlim((frame_start_timestamp, frame_stop_timestamp))
     plt.legend()
