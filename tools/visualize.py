@@ -47,12 +47,13 @@ def main():
     parser.add_argument('filename')
     parser.add_argument('--hide-gpu-allocations', action='store_true', default=False)
     parser.add_argument('--hide-cpu-allocations', action='store_true', default=False)
-    parser.add_argument('--show-submits', action='store_true', default=True)
+    parser.add_argument('--show-submits', action='store_true', default=False)
     parser.add_argument('--show-acquire', action='store_true', default=False)
     parser.add_argument('--show-memcpy-device-to-device', action='store_true', default=False)
     parser.add_argument('--show-memcpy-host-to-device', action='store_true', default=False)
     parser.add_argument('--show-memcpy-device-to-host', action='store_true', default=False)
     parser.add_argument('--frame-idx', type=int, default=-1)
+    parser.add_argument('--out', type=str, default=None)
     args = parser.parse_args()
 
     # For frame subselection
@@ -247,7 +248,8 @@ def main():
         plt.xlim((frame_start_timestamp, frame_stop_timestamp))
     plt.legend()
     plt.tight_layout()
-    #plt.savefig(os.path.join(dataset_dir, f'{test_name}.svg'), bbox_inches='tight', pad_inches=0.01)
+    if args.out is not None:
+        plt.savefig(args.out, bbox_inches='tight', pad_inches=0.01)
     plt.show()
 
 
