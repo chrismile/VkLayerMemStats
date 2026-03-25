@@ -202,26 +202,40 @@ def main():
         flags = int(curr_mem_gpu_types_flags[mem_type_idx])
         mem_type_names.append(convert_memory_property_flags_to_string(flags))
 
+    max_mem = 1
     mem_points_cpu = np.asarray(mem_points_cpu)
-    max_mem = np.max(mem_points_cpu)
+    if not args.hide_cpu_allocations:
+        max_mem = np.max(mem_points_cpu)
     for mem_type_idx in range(num_gpu_mem_types):
         mem_points_gpu_types[mem_type_idx] = np.asarray(mem_points_gpu_types[mem_type_idx])
-        if mem_points_gpu_types[mem_type_idx].shape[0] != 0:
+        if not args.hide_gpu_allocations and mem_points_gpu_types[mem_type_idx].shape[0] != 0:
             max_mem = max(max_mem, np.max(mem_points_gpu_types[mem_type_idx]))
+    gpu_device_to_device_copy_sizes = np.asarray(gpu_device_to_device_copy_sizes)
+    gpu_host_to_device_copy_sizes = np.asarray(gpu_host_to_device_copy_sizes)
+    gpu_device_to_host_copy_sizes = np.asarray(gpu_device_to_host_copy_sizes)
+    if args.show_memcpy_device_to_device and gpu_device_to_device_copy_sizes.shape[0] != 0:
+        max_mem = max(max_mem, np.max(gpu_device_to_device_copy_sizes))
+    if args.show_memcpy_host_to_device and gpu_host_to_device_copy_sizes.shape[0] != 0:
+        max_mem = max(max_mem, np.max(gpu_host_to_device_copy_sizes))
+    if args.show_memcpy_device_to_host and gpu_device_to_host_copy_sizes.shape[0] != 0:
+        max_mem = max(max_mem, np.max(gpu_device_to_host_copy_sizes))
     if max_mem > 1e9:
         units_mem = 'GiB'
         scale_mem = 1e9
-    else:
+    elif max_mem > 1e6:
         units_mem = 'MiB'
         scale_mem = 1e6
+    elif max_mem > 1e3:
+        units_mem = 'KiB'
+        scale_mem = 1e3
+    else:
+        units_mem = 'B'
+        scale_mem = 1
     mem_points_cpu /= scale_mem
     for mem_type_idx in range(num_gpu_mem_types):
         mem_points_gpu_types[mem_type_idx] /= scale_mem
-    gpu_device_to_device_copy_sizes = np.asarray(gpu_device_to_device_copy_sizes)
     gpu_device_to_device_copy_sizes /= scale_mem
-    gpu_host_to_device_copy_sizes = np.asarray(gpu_host_to_device_copy_sizes)
     gpu_host_to_device_copy_sizes /= scale_mem
-    gpu_device_to_host_copy_sizes = np.asarray(gpu_device_to_host_copy_sizes)
     gpu_device_to_host_copy_sizes /= scale_mem
 
     plt.figure(1, (10, 6))
