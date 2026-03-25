@@ -31,20 +31,7 @@
 #
 
 import argparse
-from memory_properties import MemoryProperty, convert_memory_property_flags_to_string
-
-
-def to_mem_string(num_bytes):
-    size_kib = 1024.0
-    size_mib = size_kib * 1024.0
-    size_gib = size_mib * 1024.0
-    if num_bytes < size_kib:
-        return f'{num_bytes}B'
-    elif num_bytes < size_mib:
-        return f'{num_bytes / size_kib}KiB'
-    elif num_bytes < size_gib:
-        return f'{num_bytes / size_mib}MiB'
-    return f'{num_bytes / size_gib}GiB'
+from memory_properties import MemoryProperty, convert_memory_property_flags_to_string, to_mem_string
 
 
 def main():

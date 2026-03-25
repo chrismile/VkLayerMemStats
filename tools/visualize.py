@@ -37,6 +37,17 @@ import matplotlib.pyplot as plt
 from memory_properties import MemoryProperty, convert_memory_property_flags_to_string
 
 
+def filter_time(timestamps, values=None, start_timestamp=0.0, stop_timestamp=0.0, line=False):
+    min_idx = np.searchsorted(timestamps, start_timestamp, side='left')
+    max_idx = np.searchsorted(timestamps, stop_timestamp, side='right')
+    if line:
+        min_idx = max(min_idx - 1, 0)
+        max_idx = max(min_idx + 1, len(timestamps))
+    return timestamps[min_idx:max_idx], values[min_idx:max_idx] if values is not None else values
+
+
+
+
 def main():
     #matplotlib.rcParams['pdf.fonttype'] = 42
     #matplotlib.rcParams['ps.fonttype'] = 42
@@ -53,6 +64,7 @@ def main():
     parser.add_argument('--show-memcpy-host-to-device', action='store_true', default=False)
     parser.add_argument('--show-memcpy-device-to-host', action='store_true', default=False)
     parser.add_argument('--frame-idx', type=int, default=-1)
+    parser.add_argument('--plot-only-frame', action='store_true', default=False)
     parser.add_argument('--out', type=str, default=None)
     args = parser.parse_args()
 
@@ -213,6 +225,33 @@ def main():
     gpu_device_to_device_copy_sizes = np.asarray(gpu_device_to_device_copy_sizes)
     gpu_host_to_device_copy_sizes = np.asarray(gpu_host_to_device_copy_sizes)
     gpu_device_to_host_copy_sizes = np.asarray(gpu_device_to_host_copy_sizes)
+
+    # Only plot data from selected frame.
+    if args.frame_idx >= 0 and args.plot_only_frame:
+        gpu_device_to_device_copy_timestamps, gpu_device_to_device_copy_sizes = filter_time(
+            timestamps=gpu_device_to_device_copy_timestamps, values=gpu_device_to_device_copy_sizes,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp)
+        gpu_host_to_device_copy_timestamps, gpu_host_to_device_copy_sizes = filter_time(
+            timestamps=gpu_host_to_device_copy_timestamps, values=gpu_host_to_device_copy_sizes,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp)
+        gpu_device_to_host_copy_timestamps, gpu_device_to_host_copy_sizes = filter_time(
+            timestamps=gpu_device_to_host_copy_timestamps, values=gpu_device_to_host_copy_sizes,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp)
+        time_points_cpu, mem_points_cpu = filter_time(
+            timestamps=time_points_cpu, values=mem_points_cpu,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp, line=True)
+        if not args.hide_gpu_allocations:
+            for mem_type_idx in range(num_gpu_mem_types):
+                time_points_gpu_types[mem_type_idx], mem_points_gpu_types[mem_type_idx] = filter_time(
+                    timestamps=time_points_gpu_types[mem_type_idx], values=mem_points_gpu_types[mem_type_idx],
+                    start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp, line=True)
+        submit_timestamps, _ = filter_time(
+            timestamps=submit_timestamps,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp)
+        image_acquire_timestamps, _ = filter_time(
+            timestamps=image_acquire_timestamps,
+            start_timestamp=frame_start_timestamp, stop_timestamp=frame_stop_timestamp)
+
     if args.show_memcpy_device_to_device and gpu_device_to_device_copy_sizes.shape[0] != 0:
         max_mem = max(max_mem, np.max(gpu_device_to_device_copy_sizes))
     if args.show_memcpy_host_to_device and gpu_host_to_device_copy_sizes.shape[0] != 0:
