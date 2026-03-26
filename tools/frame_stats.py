@@ -109,7 +109,7 @@ def main():
                 buffer_src_ptr = entries[3]
                 buffer_dst_ptr = entries[4]
                 copy_statistics.add_copy_buffer(copy_size, buffer_src_ptr, buffer_dst_ptr)
-            elif entries[0] == 'copy_image':
+            elif entries[0] == 'copy_image' and is_frame_current:
                 copy_size = float(entries[2])
                 image_src_ptr = entries[3]
                 image_dst_ptr = entries[4]
