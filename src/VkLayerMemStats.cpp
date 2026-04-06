@@ -574,9 +574,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
         VkDevice device, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
     auto* profiler = profilerMap[getDispatchKey(device)];
-    for (auto& frameData : profiler->submitsInFlight) {
-        frameData.second->readBack();
-        profiler->freeSubmitDataList.push_back(frameData.second);
+    for (auto* frameData : profiler->submitsInFlight) {
+        frameData->readBack();
+        profiler->freeSubmitDataList.push_back(frameData);
     }
     profiler->submitsInFlight.clear();
     for (auto* frameData : profiler->freeSubmitDataList) {
@@ -701,9 +701,9 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EndCommandBuffer(Vk
             getTimeStamp(), profiler->commandIndex++);
 
     if (settings.useProfiler && profiler->supportsQueries) {
-        auto it = profiler->submitsInFlight.find(commandBuffer);
-        if (it != profiler->submitsInFlight.end()) {
-            it->second->submissionQueryAdder.reset();
+        auto submitData = profiler->findSubmitInFlight(commandBuffer);
+        if (submitData) {
+            submitData->submissionQueryAdder.reset();
         }
     }
 
@@ -922,39 +922,39 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
     if (settings.useProfiler && profiler->supportsQueries) {
         for (uint32_t submitIdx = 0; submitIdx < submitCount; submitIdx++) {
             for (uint32_t cmdBufIdx = 0; cmdBufIdx < pSubmits[submitIdx].commandBufferCount; cmdBufIdx++) {
-                auto it = profiler->submitsInFlight.find(pSubmits[submitIdx].pCommandBuffers[cmdBufIdx]);
-                if (it != profiler->submitsInFlight.end()) {
-                    it->second->submitted = true;
-                    it->second->submitTimestamp = timestamp;
-                    it->second->queue = queue;
-                    it->second->fence = fence;
-                    it->second->signalSemaphores.resize(pSubmits[submitIdx].signalSemaphoreCount);
+                auto submitData = profiler->findSubmitInFlight(pSubmits[submitIdx].pCommandBuffers[cmdBufIdx]);
+                if (submitData) {
+                    submitData->submitted = true;
+                    submitData->submitTimestamp = timestamp;
+                    submitData->queue = queue;
+                    submitData->fence = fence;
+                    submitData->signalSemaphores.resize(pSubmits[submitIdx].signalSemaphoreCount);
                     for (uint32_t signalSemIdx = 0; signalSemIdx < pSubmits[submitIdx].signalSemaphoreCount; signalSemIdx++) {
-                        it->second->signalSemaphores[signalSemIdx] = pSubmits[submitIdx].pSignalSemaphores[signalSemIdx];
+                        submitData->signalSemaphores[signalSemIdx] = pSubmits[submitIdx].pSignalSemaphores[signalSemIdx];
                     }
-                    it->second->waitSemaphores.resize(pSubmits[submitIdx].waitSemaphoreCount);
+                    submitData->waitSemaphores.resize(pSubmits[submitIdx].waitSemaphoreCount);
                     for (uint32_t waitSemIdx = 0; waitSemIdx < pSubmits[submitIdx].waitSemaphoreCount; waitSemIdx++) {
-                        it->second->waitSemaphores[waitSemIdx] = pSubmits[submitIdx].pWaitSemaphores[waitSemIdx];
+                        submitData->waitSemaphores[waitSemIdx] = pSubmits[submitIdx].pWaitSemaphores[waitSemIdx];
                     }
                     auto* pNext = pSubmits[submitIdx].pNext;
                     while (pNext) {
                         auto* baseStructurePtr = reinterpret_cast<const VkBaseInStructure*>(pNext);
                         if (baseStructurePtr->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
                             auto* timelineSemaphoreSubmitInfo = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(pNext);
-                            it->second->signalSemaphoreValues.resize(timelineSemaphoreSubmitInfo->signalSemaphoreValueCount);
+                            submitData->signalSemaphoreValues.resize(timelineSemaphoreSubmitInfo->signalSemaphoreValueCount);
                             for (uint32_t signalSemIdx = 0; signalSemIdx < timelineSemaphoreSubmitInfo->signalSemaphoreValueCount; signalSemIdx++) {
-                                it->second->signalSemaphoreValues[signalSemIdx] = timelineSemaphoreSubmitInfo->pSignalSemaphoreValues[signalSemIdx];
+                                submitData->signalSemaphoreValues[signalSemIdx] = timelineSemaphoreSubmitInfo->pSignalSemaphoreValues[signalSemIdx];
                             }
-                            it->second->waitSemaphoreValues.resize(timelineSemaphoreSubmitInfo->waitSemaphoreValueCount);
+                            submitData->waitSemaphoreValues.resize(timelineSemaphoreSubmitInfo->waitSemaphoreValueCount);
                             for (uint32_t waitSemIdx = 0; waitSemIdx < timelineSemaphoreSubmitInfo->waitSemaphoreValueCount; waitSemIdx++) {
-                                it->second->waitSemaphoreValues[waitSemIdx] = timelineSemaphoreSubmitInfo->pWaitSemaphoreValues[waitSemIdx];
+                                submitData->waitSemaphoreValues[waitSemIdx] = timelineSemaphoreSubmitInfo->pWaitSemaphoreValues[waitSemIdx];
                             }
                             break;
                         }
                         pNext = baseStructurePtr->pNext;
                     }
-                    it->second->signalSemaphoreValues.resize(it->second->signalSemaphores.size(), 1);
-                    it->second->waitSemaphoreValues.resize(it->second->waitSemaphores.size(), 1);
+                    submitData->signalSemaphoreValues.resize(submitData->signalSemaphores.size(), 1);
+                    submitData->waitSemaphoreValues.resize(submitData->waitSemaphores.size(), 1);
                 }
             }
         }
@@ -1019,7 +1019,7 @@ static void onSemaphoreSignaled(void* dispatchKey, VkSemaphore semaphore, uint64
     auto* profiler = profilerMap[dispatchKey];
     std::vector<MemStatsLayer_SubmitData*> finishedSubmitDataList;
     for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
-        auto& submitData = it->second;
+        auto& submitData = *it;
         for (size_t signalSemIdx = 0; signalSemIdx < submitData->signalSemaphores.size(); signalSemIdx++) {
             if (submitData->submitted && submitData->signalSemaphores.at(signalSemIdx) == semaphore
                     && submitData->signalSemaphoreValues.at(signalSemIdx) <= semaphoreValue) {
@@ -1050,7 +1050,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitForFences(
     if (settings.useProfiler && profiler->supportsQueries && (waitAll || fenceCount == 1)) {
         for (uint32_t fenceIdx = 0; fenceIdx < fenceCount; fenceIdx++) {
             for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
-                auto* submitData = it->second;
+                auto* submitData = *it;
                 if (submitData->submitted && submitData->fence == pFences[fenceIdx]) {
                     profiler->submitsInFlight.erase(it);
                     onSubmitDataFinished(dispatchKey, submitData, true);
@@ -1101,7 +1101,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_DeviceWaitIdle(VkDe
         do {
             changed = false;
             for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
-                auto* submitData = it->second;
+                auto* submitData = *it;
                 if (submitData->submitted && submitData->submitTimestamp <= timestamp) {
                     auto itOld = it;
                     profiler->submitsInFlight.erase(itOld);
@@ -1133,7 +1133,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueWaitIdle(VkQue
         do {
             changed = false;
             for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
-                auto* submitData = it->second;
+                auto* submitData = *it;
                 if (submitData->submitted && submitData->submitTimestamp <= timestamp && submitData->queue == queue) {
                     auto itOld = it;
                     profiler->submitsInFlight.erase(itOld);

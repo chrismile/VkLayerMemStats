@@ -30,7 +30,7 @@
 #define VKLAYERMEMSTATS_PROFILER_HPP
 
 #include <vector>
-#include <unordered_map>
+#include <list>
 #include <cmath>
 #include <cstdint>
 
@@ -100,6 +100,7 @@ struct MemStatsLayer_SubmitData {
     uint32_t numDirtyQueries = maxNumQueries;
 
     // Data added by vkQueueSubmit.
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkFence fence;
     std::vector<VkSemaphore> waitSemaphores;
@@ -121,8 +122,16 @@ struct MemStatsLayer_Profiler {
     bool supportsQueries = false;
     float timestampPeriod = 1.0f;
 
+    MemStatsLayer_SubmitData* findSubmitInFlight(VkCommandBuffer commandBuffer) {
+        for (auto& submitData : submitsInFlight) {
+            if (submitData->commandBuffer == commandBuffer) {
+                return submitData;
+            }
+        }
+        return nullptr;
+    }
     const uint32_t maxNumSubmitsInFlight = 16;
-    std::unordered_map<VkCommandBuffer, MemStatsLayer_SubmitData*> submitsInFlight;
+    std::list<MemStatsLayer_SubmitData*> submitsInFlight;
     std::vector<MemStatsLayer_SubmitData*> freeSubmitDataList; /// New submit data gets added by @see MemStatsLayer_QueryAdder.
 };
 
@@ -158,6 +167,7 @@ inline MemStatsLayer_SubmitData::~MemStatsLayer_SubmitData() {
 }
 
 void MemStatsLayer_SubmitData::reset() {
+    commandBuffer = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
     queries.clear();
     submitted = false;
@@ -213,8 +223,8 @@ MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
 
     if (settings.useProfiler && profiler->supportsQueries) {
-        auto it = profiler->submitsInFlight.find(commandBuffer);
-        if (it == profiler->submitsInFlight.end()) {
+        submitData = profiler->findSubmitInFlight(commandBuffer);
+        if (!submitData) {
             if (profiler->freeSubmitDataList.empty()) {
                 if (profiler->submitsInFlight.size() > profiler->maxNumSubmitsInFlight) {
                     std::cerr << "[VkLayer_memstats] Exceeded maximum number of submits in flight." << std::endl;
@@ -229,12 +239,13 @@ MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
                 profiler->freeSubmitDataList.push_back(submitData);
             }
             auto* frameDataNew = profiler->freeSubmitDataList.back();
+            frameDataNew->commandBuffer = commandBuffer;
             frameDataNew->globalFrameIndex = profiler->currentFrameIndex;
             profiler->freeSubmitDataList.pop_back();
             profiler->pCmdResetQueryPool(commandBuffer, frameDataNew->queryPool, 0, frameDataNew->numDirtyQueries);
-            it = profiler->submitsInFlight.insert(std::make_pair(commandBuffer, frameDataNew)).first;
+            profiler->submitsInFlight.push_back(frameDataNew);
+            submitData = frameDataNew;
         }
-        submitData = it->second;
         auto numQueries = static_cast<uint32_t>(submitData->queries.size()) * 2;
         if (numQueries <= submitData->maxNumQueries) {
             MemStatsLayer_Query query{};
