@@ -31,6 +31,7 @@
  */
 
 #include <iostream>
+#include <list>
 #include <map>
 #include <chrono>
 #include <fstream>
@@ -44,9 +45,15 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/utility/vk_dispatch_table.h>
 #include <vulkan/layer/vk_layer_settings.h>
+#include <vulkan/layer/vk_layer_settings.hpp>
+
+#define FILE_FORMAT_VERSION_NUMBER 1
 
 #ifdef HOOK_MALLOC
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include <cstdarg>
 #include <windows.h>
@@ -83,10 +90,17 @@ void* getDispatchKey(DispatchT inst) {
     return *reinterpret_cast<void**>(inst);
 }
 
+/// Layer settings.
+struct MemStatsLayerSettings {
+    bool useProfiler = false;
+};
+
 // Instance and device dispatch tables and settings.
 static std::map<void*, VkuInstanceDispatchTable> instanceDispatchTables;
 static std::map<void*, VkInstance> instances;
+static std::map<void*, MemStatsLayerSettings> instanceLayerSettings;
 static std::map<void*, VkuDeviceDispatchTable> deviceDispatchTables;
+static std::map<void*, MemStatsLayerSettings> deviceLayerSettings;
 
 /**
  * Global lock for access to the maps above.
@@ -252,6 +266,25 @@ static void fprintf_save(FILE* stream, const char* format, ...) {
 #define fprintf_save fprintf
 #endif
 
+#if !defined(_WIN32) && defined(HOOK_MALLOC)
+#define fprintf_wrapper(...) \
+    ACQUIRE_ALLOC(); \
+    if (getpid() == MemStatsLayer_pid) \
+    { \
+        fprintf_save(__VA_ARGS__); \
+    } \
+    RELEASE_ALLOC();
+#else
+#define fprintf_wrapper(...) \
+    ACQUIRE_ALLOC(); \
+    fprintf_save(__VA_ARGS__); \
+    RELEASE_ALLOC();
+#endif
+
+
+
+#include "Profiler.hpp"
+
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     if (allocType == AllocType::CPU) {
         fprintf_save(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",%p\n",
@@ -359,13 +392,35 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateInstance(
     dispatchTable.EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)pGetInstanceProcAddr(
             *pInstance, "vkEnumerateDeviceExtensionProperties");
 
+    VkuLayerSettingSet layerSettingSet = VK_NULL_HANDLE;
+    result = vkuCreateLayerSettingSet(
+            VK_LAYER_NAME, vkuFindLayerSettingsCreateInfo(pCreateInfo), pAllocator, nullptr, &layerSettingSet);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    MemStatsLayerSettings settings{};
+    const char *settingKeyProfiler = "profiler";
+    if (vkuHasLayerSetting(layerSettingSet, settingKeyProfiler)) {
+        std::string profilerString;
+        vkuGetLayerSettingValue(layerSettingSet, settingKeyProfiler, profilerString);
+        std::transform(
+                profilerString.begin(), profilerString.end(), profilerString.begin(),
+                [](unsigned char c){ return std::tolower(c); });
+        if (profilerString == "on" || profilerString == "1") {
+            settings.useProfiler = true;
+        }
+    }
+    vkuDestroyLayerSettingSet(layerSettingSet, pAllocator);
+
     {
         scoped_lock l(globalMutex);
         instanceDispatchTables[getDispatchKey(*pInstance)] = dispatchTable;
+        instanceLayerSettings[getDispatchKey(*pInstance)] = settings;
         instances[getDispatchKey(*pInstance)] = *pInstance;
 #ifndef HOOK_MALLOC
         if (MemStatsLayer_refcount == 0) {
             MemStatsLayer_outFile = fopen("memstats.csv", "w");
+            fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
             MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
         }
         ++MemStatsLayer_refcount;
@@ -378,6 +433,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyInstance(
         VkInstance instance, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
     instanceDispatchTables.erase(getDispatchKey(instance));
+    instanceLayerSettings.erase(getDispatchKey(instance));
     instances.erase(getDispatchKey(instance));
 #ifndef HOOK_MALLOC
     --MemStatsLayer_refcount;
@@ -426,6 +482,12 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
             instance, "vkGetPhysicalDeviceProperties");
     auto pGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)pGetInstanceProcAddr(
             instance, "vkGetPhysicalDeviceMemoryProperties");
+    auto pCreateQueryPool = (PFN_vkCreateQueryPool)pGetInstanceProcAddr(instance, "vkCreateQueryPool");
+    auto pDestroyQueryPool = (PFN_vkDestroyQueryPool)pGetInstanceProcAddr(instance, "vkDestroyQueryPool");
+    auto pResetQueryPool = (PFN_vkResetQueryPool)pGetInstanceProcAddr(instance, "vkResetQueryPool");
+    auto pCmdResetQueryPool = (PFN_vkCmdResetQueryPool)pGetInstanceProcAddr(instance, "vkCmdResetQueryPool");
+    auto pGetQueryPoolResults = (PFN_vkGetQueryPoolResults)pGetInstanceProcAddr(instance, "vkGetQueryPoolResults");
+    auto pCmdWriteTimestamp = (PFN_vkCmdWriteTimestamp)pGetInstanceProcAddr(instance, "vkCmdWriteTimestamp");
 
     VkResult result = pCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (result != VK_SUCCESS) {
@@ -442,12 +504,27 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.BindImageMemory = (PFN_vkBindImageMemory)pGetDeviceProcAddr(*pDevice, "vkBindImageMemory");
     dispatchTable.DestroyBuffer = (PFN_vkDestroyBuffer)pGetDeviceProcAddr(*pDevice, "vkDestroyBuffer");
     dispatchTable.DestroyImage = (PFN_vkDestroyImage)pGetDeviceProcAddr(*pDevice, "vkDestroyImage");
+    dispatchTable.BeginCommandBuffer = (PFN_vkBeginCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
+    dispatchTable.EndCommandBuffer = (PFN_vkEndCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkEndCommandBuffer");
     dispatchTable.CmdCopyBuffer = (PFN_vkCmdCopyBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer");
     dispatchTable.CmdCopyImage = (PFN_vkCmdCopyImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImage");
     dispatchTable.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage");
     dispatchTable.CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImageToBuffer");
+    dispatchTable.CmdDispatch = (PFN_vkCmdDispatch)pGetDeviceProcAddr(*pDevice, "vkCmdDispatch");
+    dispatchTable.CmdDispatchIndirect = (PFN_vkCmdDispatchIndirect)pGetDeviceProcAddr(*pDevice, "vkCmdDispatchIndirect");
+    dispatchTable.CmdDraw = (PFN_vkCmdDraw)pGetDeviceProcAddr(*pDevice, "vkCmdDraw");
+    dispatchTable.CmdDrawIndirect = (PFN_vkCmdDrawIndirect)pGetDeviceProcAddr(*pDevice, "vkCmdDrawIndirect");
+    dispatchTable.CmdDrawIndirectCount = (PFN_vkCmdDrawIndirectCount)pGetDeviceProcAddr(*pDevice, "vkCmdDrawIndirectCount");
+    dispatchTable.CmdDrawIndexed = (PFN_vkCmdDrawIndexed)pGetDeviceProcAddr(*pDevice, "vkCmdDrawIndexed");
+    dispatchTable.CmdDrawIndexedIndirect = (PFN_vkCmdDrawIndexedIndirect)pGetDeviceProcAddr(*pDevice, "vkCmdDrawIndexedIndirect");
+    dispatchTable.CmdDrawIndexedIndirectCount = (PFN_vkCmdDrawIndexedIndirectCount)pGetDeviceProcAddr(*pDevice, "vkCmdDrawIndexedIndirectCount");
     dispatchTable.QueueSubmit = (PFN_vkQueueSubmit)pGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
     dispatchTable.AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)pGetDeviceProcAddr(*pDevice, "vkAcquireNextImageKHR");
+    dispatchTable.QueuePresentKHR = (PFN_vkQueuePresentKHR)pGetDeviceProcAddr(*pDevice, "vkQueuePresentKHR");
+    dispatchTable.WaitForFences = (PFN_vkWaitForFences)pGetDeviceProcAddr(*pDevice, "vkWaitForFences");
+    dispatchTable.WaitSemaphores = (PFN_vkWaitSemaphores)pGetDeviceProcAddr(*pDevice, "vkWaitSemaphores");
+    dispatchTable.DeviceWaitIdle = (PFN_vkDeviceWaitIdle)pGetDeviceProcAddr(*pDevice, "vkDeviceWaitIdle");
+    dispatchTable.QueueWaitIdle = (PFN_vkQueueWaitIdle)pGetDeviceProcAddr(*pDevice, "vkQueueWaitIdle");
 
     // Write memory statistics.
     VkPhysicalDeviceProperties deviceProperties{};
@@ -477,6 +554,18 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     {
         scoped_lock l(globalMutex);
         deviceDispatchTables[getDispatchKey(*pDevice)] = dispatchTable;
+        deviceLayerSettings[getDispatchKey(*pDevice)] = instanceLayerSettings[getDispatchKey(physicalDevice)];
+        auto* profiler = new MemStatsLayer_Profiler;
+        profiler->device = *pDevice;
+        profiler->pCreateQueryPool = pCreateQueryPool;
+        profiler->pDestroyQueryPool = pDestroyQueryPool;
+        profiler->pResetQueryPool = pResetQueryPool;
+        profiler->pCmdResetQueryPool = pCmdResetQueryPool;
+        profiler->pGetQueryPoolResults = pGetQueryPoolResults;
+        profiler->pCmdWriteTimestamp = pCmdWriteTimestamp;
+        profiler->supportsQueries = deviceProperties.limits.timestampComputeAndGraphics;
+        profiler->timestampPeriod = deviceProperties.limits.timestampPeriod;
+        profilerMap[getDispatchKey(*pDevice)] = profiler;
     }
     return VK_SUCCESS;
 }
@@ -484,7 +573,19 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
 VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
         VkDevice device, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
+    auto* profiler = profilerMap[getDispatchKey(device)];
+    for (auto& frameData : profiler->submitsInFlight) {
+        frameData.second->readBack();
+        profiler->freeSubmitDataList.push_back(frameData.second);
+    }
+    profiler->submitsInFlight.clear();
+    for (auto* frameData : profiler->freeSubmitDataList) {
+        delete frameData;
+    }
+    delete profiler;
+    profilerMap.erase(getDispatchKey(device));
     deviceDispatchTables.erase(getDispatchKey(device));
+    deviceLayerSettings.erase(getDispatchKey(device));
 }
 
 
@@ -530,16 +631,9 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindBufferMemory(
         VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     scoped_lock l(globalMutex);
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "bind_buffer_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
-                getTimeStamp(), buffer, memory, memoryOffset);
-    }
-    RELEASE_ALLOC();
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "bind_buffer_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
+            getTimeStamp(), buffer, memory, memoryOffset);
 
     return deviceDispatchTables[getDispatchKey(device)].BindBufferMemory(device, buffer, memory, memoryOffset);
 }
@@ -548,16 +642,9 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindImageMemory(
         VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     scoped_lock l(globalMutex);
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "bind_image_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
-                getTimeStamp(), image, memory, memoryOffset);
-    }
-    RELEASE_ALLOC();
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "bind_image_memory,%" PRIu64 ",%p,%p,%" PRIu64 "\n",
+            getTimeStamp(), image, memory, memoryOffset);
 
     return deviceDispatchTables[getDispatchKey(device)].BindImageMemory(device, image, memory, memoryOffset);
 }
@@ -566,14 +653,7 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyBuffer(
         VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(MemStatsLayer_outFile, "destroy_buffer,%" PRIu64 ",%p\n", getTimeStamp(), buffer);
-    }
-    RELEASE_ALLOC();
+    fprintf_wrapper(MemStatsLayer_outFile, "destroy_buffer,%" PRIu64 ",%p\n", getTimeStamp(), buffer);
 
     deviceDispatchTables[getDispatchKey(device)].DestroyBuffer(device, buffer, pAllocator);
 }
@@ -582,17 +662,54 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyImage(
         VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(MemStatsLayer_outFile, "destroy_image,%" PRIu64 ",%p\n", getTimeStamp(), image);
-    }
-    RELEASE_ALLOC();
+    fprintf_wrapper(MemStatsLayer_outFile, "destroy_image,%" PRIu64 ",%p\n", getTimeStamp(), image);
 
     deviceDispatchTables[getDispatchKey(device)].DestroyImage(device, image, pAllocator);
 }
+
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BeginCommandBuffer(
+        VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
+    scoped_lock l(globalMutex);
+
+    const auto& settings = deviceLayerSettings[getDispatchKey(commandBuffer)];
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "begin_command_buffer,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(commandBuffer)].BeginCommandBuffer(commandBuffer, pBeginInfo);
+
+    if (res == VK_SUCCESS && settings.useProfiler && profiler->supportsQueries) {
+        auto queryAdder = std::make_shared<MemStatsLayer_QueryAdder>(
+                commandBuffer, MemStatsLayerQueryType::COMMAND_BUFFER_SUBMISSION);
+        if (queryAdder->isValid) {
+            queryAdder->submitData->submissionQueryAdder = queryAdder;
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EndCommandBuffer(VkCommandBuffer commandBuffer) {
+    scoped_lock l(globalMutex);
+
+    const auto& settings = deviceLayerSettings[getDispatchKey(commandBuffer)];
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "end_command_buffer,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    if (settings.useProfiler && profiler->supportsQueries) {
+        auto it = profiler->submitsInFlight.find(commandBuffer);
+        if (it != profiler->submitsInFlight.end()) {
+            it->second->submissionQueryAdder.reset();
+        }
+    }
+
+    return deviceDispatchTables[getDispatchKey(commandBuffer)].EndCommandBuffer(commandBuffer);
+}
+
 
 VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer(
         VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkBuffer dstBuffer, uint32_t regionCount,
@@ -603,17 +720,12 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer(
     for (uint32_t i = 0; i < regionCount; i++) {
         copySize += pRegions[i].size;
     }
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
-                getTimeStamp(), copySize, srcBuffer, dstBuffer);
-    }
-    RELEASE_ALLOC();
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, srcBuffer, dstBuffer);
 
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBuffer(
             commandBuffer, srcBuffer, dstBuffer, regionCount, pRegions);
 }
@@ -627,17 +739,12 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImage(
     for (uint32_t i = 0; i < regionCount; i++) {
         copySize += pRegions[i].extent.width * pRegions[i].extent.height * pRegions[i].extent.depth;
     }
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
-                getTimeStamp(), copySize, srcImage, dstImage);
-    }
-    RELEASE_ALLOC();
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, srcImage, dstImage);
 
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImage(
             commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions);
 }
@@ -651,17 +758,12 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBufferToImage(
     for (uint32_t i = 0; i < regionCount; i++) {
         copySize += pRegions[i].imageExtent.width * pRegions[i].imageExtent.height * pRegions[i].imageExtent.depth;
     }
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
-                getTimeStamp(), copySize, srcBuffer, dstImage);
-    }
-    RELEASE_ALLOC();
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, srcBuffer, dstImage);
 
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER_TO_IMAGE);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBufferToImage(
             commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
 }
@@ -675,20 +777,132 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer(
     for (uint32_t i = 0; i < regionCount; i++) {
         copySize += pRegions[i].imageExtent.width * pRegions[i].imageExtent.height * pRegions[i].imageExtent.depth;
     }
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(
-                MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%p,%p\n",
-                getTimeStamp(), copySize, srcImage, dstBuffer);
-    }
-    RELEASE_ALLOC();
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%p,%p\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, srcImage, dstBuffer);
 
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer(
             commandBuffer, srcImage, srcImageLayout, dstBuffer, regionCount, pRegions);
 }
+
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDispatch(
+        VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "dispatch,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DISPATCH);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDispatch(
+            commandBuffer, groupCountX, groupCountY, groupCountZ);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDispatchIndirect(
+        VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "dispatch_indirect,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DISPATCH_INDIRECT);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDispatchIndirect(commandBuffer, buffer, offset);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDraw(
+        VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+        uint32_t firstInstance) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDraw(
+            commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndirect(
+        VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw_indirect,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDIRECT);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndirect(
+            commandBuffer, buffer, offset, drawCount, stride);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndirectCount(
+        VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
+        VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw_indirect_count,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDIRECT_COUNT);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndirectCount(
+            commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexed(
+        VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+        int32_t vertexOffset, uint32_t firstInstance) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw_indexed,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexed(
+            commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexedIndirect(
+        VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw_indexed_indirect,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED_INDIRECT);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexedIndirect(
+            commandBuffer, buffer, offset, drawCount, stride);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexedIndirectCount(
+        VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer,
+        VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
+    scoped_lock l(globalMutex);
+
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "draw_indexed_indirect_count,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->commandIndex++);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED_INDIRECT_COUNT);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexedIndirectCount(
+            commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+}
+
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
         VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
@@ -699,15 +913,52 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueSubmit(
         return res;
     }
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", getTimeStamp());
-    }
-    RELEASE_ALLOC();
+    const auto& settings = deviceLayerSettings[getDispatchKey(queue)];
+    auto* profiler = profilerMap[getDispatchKey(queue)];
 
+    auto timestamp = getTimeStamp();
+    fprintf_wrapper(MemStatsLayer_outFile, "submit,%" PRIu64 "\n", timestamp);
+
+    if (settings.useProfiler && profiler->supportsQueries) {
+        for (uint32_t submitIdx = 0; submitIdx < submitCount; submitIdx++) {
+            for (uint32_t cmdBufIdx = 0; cmdBufIdx < pSubmits[submitIdx].commandBufferCount; cmdBufIdx++) {
+                auto it = profiler->submitsInFlight.find(pSubmits[submitIdx].pCommandBuffers[cmdBufIdx]);
+                if (it != profiler->submitsInFlight.end()) {
+                    it->second->submitted = true;
+                    it->second->submitTimestamp = timestamp;
+                    it->second->queue = queue;
+                    it->second->fence = fence;
+                    it->second->signalSemaphores.resize(pSubmits[submitIdx].signalSemaphoreCount);
+                    for (uint32_t signalSemIdx = 0; signalSemIdx < pSubmits[submitIdx].signalSemaphoreCount; signalSemIdx++) {
+                        it->second->signalSemaphores[signalSemIdx] = pSubmits[submitIdx].pSignalSemaphores[signalSemIdx];
+                    }
+                    it->second->waitSemaphores.resize(pSubmits[submitIdx].waitSemaphoreCount);
+                    for (uint32_t waitSemIdx = 0; waitSemIdx < pSubmits[submitIdx].waitSemaphoreCount; waitSemIdx++) {
+                        it->second->waitSemaphores[waitSemIdx] = pSubmits[submitIdx].pWaitSemaphores[waitSemIdx];
+                    }
+                    auto* pNext = pSubmits[submitIdx].pNext;
+                    while (pNext) {
+                        auto* baseStructurePtr = reinterpret_cast<const VkBaseInStructure*>(pNext);
+                        if (baseStructurePtr->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                            auto* timelineSemaphoreSubmitInfo = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(pNext);
+                            it->second->signalSemaphoreValues.resize(timelineSemaphoreSubmitInfo->signalSemaphoreValueCount);
+                            for (uint32_t signalSemIdx = 0; signalSemIdx < timelineSemaphoreSubmitInfo->signalSemaphoreValueCount; signalSemIdx++) {
+                                it->second->signalSemaphoreValues[signalSemIdx] = timelineSemaphoreSubmitInfo->pSignalSemaphoreValues[signalSemIdx];
+                            }
+                            it->second->waitSemaphoreValues.resize(timelineSemaphoreSubmitInfo->waitSemaphoreValueCount);
+                            for (uint32_t waitSemIdx = 0; waitSemIdx < timelineSemaphoreSubmitInfo->waitSemaphoreValueCount; waitSemIdx++) {
+                                it->second->waitSemaphoreValues[waitSemIdx] = timelineSemaphoreSubmitInfo->pWaitSemaphoreValues[waitSemIdx];
+                            }
+                            break;
+                        }
+                        pNext = baseStructurePtr->pNext;
+                    }
+                    it->second->signalSemaphoreValues.resize(it->second->signalSemaphores.size(), 1);
+                    it->second->waitSemaphoreValues.resize(it->second->waitSemaphores.size(), 1);
+                }
+            }
+        }
+    }
 
     return res;
 }
@@ -723,14 +974,176 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_AcquireNextImageKHR
         return res;
     }
 
-    ACQUIRE_ALLOC();
-#if !defined(_WIN32) && defined(HOOK_MALLOC)
-    if (getpid() == MemStatsLayer_pid)
-#endif
-    {
-        fprintf_save(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
+    fprintf_wrapper(MemStatsLayer_outFile, "acquire_next_image,%" PRIu64 "\n", getTimeStamp());
+
+    return res;
+}
+
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueuePresentKHR(
+        VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(queue)].QueuePresentKHR(queue, pPresentInfo);
+    if (res != VK_SUCCESS) {
+        return res;
     }
-    RELEASE_ALLOC();
+
+    auto* profiler = profilerMap[getDispatchKey(queue)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "present,%" PRIu64 ",%" PRIu64 "\n",
+            getTimeStamp(), profiler->currentFrameIndex);
+    profiler->currentFrameIndex++;
+
+    return res;
+}
+
+
+static void onSemaphoreSignaled(void* dispatchKey, VkSemaphore semaphore, uint64_t semaphoreValue);
+
+static void onSubmitDataFinished(void* dispatchKey, MemStatsLayer_SubmitData* submitData, bool transitive) {
+    auto* profiler = profilerMap[dispatchKey];
+    submitData->readBack();
+    if (transitive) {
+        for (size_t waitSemIdx = 0; waitSemIdx < submitData->waitSemaphores.size(); waitSemIdx++) {
+            onSemaphoreSignaled(
+                    dispatchKey, submitData->waitSemaphores.at(waitSemIdx),
+                    submitData->waitSemaphoreValues.at(waitSemIdx));
+        }
+    }
+    submitData->reset();
+    profiler->freeSubmitDataList.push_back(submitData);
+}
+
+static void onSemaphoreSignaled(void* dispatchKey, VkSemaphore semaphore, uint64_t semaphoreValue) {
+    auto* profiler = profilerMap[dispatchKey];
+    std::vector<MemStatsLayer_SubmitData*> finishedSubmitDataList;
+    for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
+        auto& submitData = it->second;
+        for (size_t signalSemIdx = 0; signalSemIdx < submitData->signalSemaphores.size(); signalSemIdx++) {
+            if (submitData->submitted && submitData->signalSemaphores.at(signalSemIdx) == semaphore
+                    && submitData->signalSemaphoreValues.at(signalSemIdx) <= semaphoreValue) {
+                profiler->submitsInFlight.erase(it);
+                finishedSubmitDataList.push_back(submitData);
+                break;
+            }
+        }
+    }
+    for (auto* submitData : finishedSubmitDataList) {
+        onSubmitDataFinished(dispatchKey, submitData, true);
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitForFences(
+        VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].WaitForFences(
+            device, fenceCount, pFences, waitAll, timeout);
+    if (res != VK_SUCCESS) {
+        return res;
+    }
+
+    void* dispatchKey = getDispatchKey(device);
+    const auto& settings = deviceLayerSettings[dispatchKey];
+    auto* profiler = profilerMap[dispatchKey];
+    if (settings.useProfiler && profiler->supportsQueries && (waitAll || fenceCount == 1)) {
+        for (uint32_t fenceIdx = 0; fenceIdx < fenceCount; fenceIdx++) {
+            for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
+                auto* submitData = it->second;
+                if (submitData->submitted && submitData->fence == pFences[fenceIdx]) {
+                    profiler->submitsInFlight.erase(it);
+                    onSubmitDataFinished(dispatchKey, submitData, true);
+                    break;
+                }
+            }
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitSemaphores(
+        VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].WaitSemaphores(device, pWaitInfo, timeout);
+    if (res != VK_SUCCESS) {
+        return res;
+    }
+
+    void* dispatchKey = getDispatchKey(device);
+    const auto& settings = deviceLayerSettings[dispatchKey];
+    auto* profiler = profilerMap[dispatchKey];
+    if (settings.useProfiler && profiler->supportsQueries) {
+        for (uint32_t semIdx = 0; semIdx < pWaitInfo->semaphoreCount; semIdx++) {
+            onSemaphoreSignaled(dispatchKey, pWaitInfo->pSemaphores[semIdx], pWaitInfo->pValues[semIdx]);
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_DeviceWaitIdle(VkDevice device) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].DeviceWaitIdle(device);
+    if (res != VK_SUCCESS) {
+        return res;
+    }
+
+    void* dispatchKey = getDispatchKey(device);
+    const auto& settings = deviceLayerSettings[dispatchKey];
+    auto* profiler = profilerMap[dispatchKey];
+    if (settings.useProfiler && profiler->supportsQueries) {
+        uint64_t timestamp = getTimeStamp();
+        bool changed = false;
+        do {
+            changed = false;
+            for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
+                auto* submitData = it->second;
+                if (submitData->submitted && submitData->submitTimestamp <= timestamp) {
+                    auto itOld = it;
+                    profiler->submitsInFlight.erase(itOld);
+                    changed = true;
+                    onSubmitDataFinished(dispatchKey, submitData, false);
+                    break;
+                }
+            }
+        } while (changed);
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_QueueWaitIdle(VkQueue queue) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(queue)].QueueWaitIdle(queue);
+    if (res != VK_SUCCESS) {
+        return res;
+    }
+
+    void* dispatchKey = getDispatchKey(queue);
+    const auto& settings = deviceLayerSettings[dispatchKey];
+    auto* profiler = profilerMap[dispatchKey];
+    if (settings.useProfiler && profiler->supportsQueries) {
+        uint64_t timestamp = getTimeStamp();
+        bool changed = false;
+        do {
+            changed = false;
+            for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
+                auto* submitData = it->second;
+                if (submitData->submitted && submitData->submitTimestamp <= timestamp && submitData->queue == queue) {
+                    auto itOld = it;
+                    profiler->submitsInFlight.erase(itOld);
+                    changed = true;
+                    onSubmitDataFinished(dispatchKey, submitData, false);
+                    break;
+                }
+            }
+        } while (changed);
+    }
 
     return res;
 }
@@ -750,12 +1163,27 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetDevice
     GETPROCADDR_VK(BindImageMemory);
     GETPROCADDR_VK(DestroyBuffer);
     GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(BeginCommandBuffer);
+    GETPROCADDR_VK(EndCommandBuffer);
     GETPROCADDR_VK(CmdCopyBuffer);
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);
     GETPROCADDR_VK(CmdCopyImageToBuffer);
+    GETPROCADDR_VK(CmdDispatch);
+    GETPROCADDR_VK(CmdDispatchIndirect);
+    GETPROCADDR_VK(CmdDraw);
+    GETPROCADDR_VK(CmdDrawIndirect);
+    GETPROCADDR_VK(CmdDrawIndirectCount);
+    GETPROCADDR_VK(CmdDrawIndexed);
+    GETPROCADDR_VK(CmdDrawIndexedIndirect);
+    GETPROCADDR_VK(CmdDrawIndexedIndirectCount);
     GETPROCADDR_VK(QueueSubmit);
     GETPROCADDR_VK(AcquireNextImageKHR);
+    GETPROCADDR_VK(QueuePresentKHR);
+    GETPROCADDR_VK(WaitForFences);
+    GETPROCADDR_VK(WaitSemaphores);
+    GETPROCADDR_VK(DeviceWaitIdle);
+    GETPROCADDR_VK(QueueWaitIdle);
 
     {
         scoped_lock l(globalMutex);
@@ -781,12 +1209,25 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
     GETPROCADDR_VK(BindImageMemory);
     GETPROCADDR_VK(DestroyBuffer);
     GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(BeginCommandBuffer);
+    GETPROCADDR_VK(EndCommandBuffer);
     GETPROCADDR_VK(CmdCopyBuffer);
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);
     GETPROCADDR_VK(CmdCopyImageToBuffer);
+    GETPROCADDR_VK(CmdDraw);
+    GETPROCADDR_VK(CmdDrawIndirect);
+    GETPROCADDR_VK(CmdDrawIndirectCount);
+    GETPROCADDR_VK(CmdDrawIndexed);
+    GETPROCADDR_VK(CmdDrawIndexedIndirect);
+    GETPROCADDR_VK(CmdDrawIndexedIndirectCount);
     GETPROCADDR_VK(QueueSubmit);
     GETPROCADDR_VK(AcquireNextImageKHR);
+    GETPROCADDR_VK(QueuePresentKHR);
+    GETPROCADDR_VK(WaitForFences);
+    GETPROCADDR_VK(WaitSemaphores);
+    GETPROCADDR_VK(DeviceWaitIdle);
+    GETPROCADDR_VK(QueueWaitIdle);
 
     {
         scoped_lock l(globalMutex);
@@ -860,6 +1301,7 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         if (fopen_s(&MemStatsLayer_outFile, "memstats.csv", "w") != 0) {
             throw std::runtime_error("File memstats.csv could not be opened for writing.");
         }
+        fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
         MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
 
         DetourRestoreAfterWith();
@@ -884,6 +1326,7 @@ BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID reserved) {
         if (fopen_s(&MemStatsLayer_outFile, "memstats.csv", "w") != 0) {
             throw std::runtime_error("File memstats.csv could not be opened for writing.");
         }
+        fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
 
         MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
 
@@ -948,6 +1391,7 @@ static void MemStatsLayer_memtrace_init() {
 
     MemStatsLayer_outFile = fopen("memstats.csv", "w");
     MemStatsLayer_startTime = std::chrono::high_resolution_clock::now();
+    fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
 
     RELEASE_ALLOC();
 }

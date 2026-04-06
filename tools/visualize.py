@@ -68,6 +68,9 @@ def main():
     parser.add_argument('--out', type=str, default=None)
     args = parser.parse_args()
 
+    # General data
+    file_format_version = 0
+
     # For frame subselection
     frame_idx_curr = 0
     frame_start_timestamp = -1
@@ -126,7 +129,9 @@ def main():
             if len(entries) < 2:
                 continue
             timestamp = float(entries[1]) * 1e-9
-            if entries[0] == 'devinfo':
+            if entries[0] == 'version':
+                file_format_version = int(entries[2])
+            elif entries[0] == 'devinfo':
                 device_type = int(entries[2])
                 device_name = entries[3]
             elif entries[0] == 'memtype':
@@ -188,23 +193,38 @@ def main():
             elif entries[0] == 'destroy_image':
                 del gpu_image_ptr_to_alloc_ptr_map[entries[2]]
             elif entries[0] == 'copy_buffer':
-                copy_size = float(entries[2])
-                buffer_src_ptr = entries[3]
-                buffer_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    buffer_src_ptr = entries[3]
+                    buffer_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    buffer_src_ptr = entries[4]
+                    buffer_dst_ptr = entries[5]
                 mem_type_src = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_src_ptr]]
                 mem_type_dst = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]
                 add_memcpy(copy_size, mem_type_src, mem_type_dst)
             elif entries[0] == 'copy_buffer_to_image':
-                copy_size = float(entries[2])
-                buffer_src_ptr = entries[3]
-                image_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    buffer_src_ptr = entries[3]
+                    image_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    buffer_src_ptr = entries[4]
+                    image_dst_ptr = entries[5]
                 mem_type_src = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_src_ptr]]
                 mem_type_dst = gpu_mem_ptr_to_type_map[gpu_image_ptr_to_alloc_ptr_map[image_dst_ptr]]
                 add_memcpy(copy_size, mem_type_src, mem_type_dst)
             elif entries[0] == 'copy_image_to_buffer':
-                copy_size = float(entries[2])
-                image_src_ptr = entries[3]
-                buffer_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    image_src_ptr = entries[3]
+                    buffer_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    image_src_ptr = entries[4]
+                    buffer_dst_ptr = entries[5]
                 mem_type_src = gpu_mem_ptr_to_type_map[gpu_image_ptr_to_alloc_ptr_map[image_src_ptr]]
                 mem_type_dst = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]
                 add_memcpy(copy_size, mem_type_src, mem_type_dst)
@@ -216,7 +236,7 @@ def main():
 
     max_mem = 1
     mem_points_cpu = np.asarray(mem_points_cpu)
-    if not args.hide_cpu_allocations:
+    if not args.hide_cpu_allocations and mem_points_cpu.shape[0] != 0:
         max_mem = np.max(mem_points_cpu)
     for mem_type_idx in range(num_gpu_mem_types):
         mem_points_gpu_types[mem_type_idx] = np.asarray(mem_points_gpu_types[mem_type_idx])
@@ -281,7 +301,7 @@ def main():
     plt.title(f'Memory plot ({device_name})')
     plt.xlabel('Time (s)')
     plt.ylabel(f'Memory ({units_mem})')
-    if not args.hide_cpu_allocations:
+    if not args.hide_cpu_allocations and mem_points_cpu.shape[0] != 0:
         plt.plot(time_points_cpu, mem_points_cpu, label='CPU')
     if not args.hide_gpu_allocations:
         for mem_type_idx in range(num_gpu_mem_types):

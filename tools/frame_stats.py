@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--show-image-stats', action='store_true', default=False)
     args = parser.parse_args()
 
+    file_format_version = 0
     frame_idx_curr = 0
     frame_start_timestamp = -1
     frame_stop_timestamp = -1
@@ -66,7 +67,9 @@ def main():
             if len(entries) < 2:
                 continue
             timestamp = float(entries[1]) * 1e-9
-            if entries[0] == 'devinfo':
+            if entries[0] == 'version':
+                file_format_version = int(entries[2])
+            elif entries[0] == 'devinfo':
                 device_type = int(entries[2])
                 device_name = entries[3]
             elif entries[0] == 'memtype':
@@ -105,24 +108,44 @@ def main():
             elif entries[0] == 'destroy_image':
                 copy_statistics.destroy_image(entries[2])
             elif entries[0] == 'copy_buffer' and is_frame_current:
-                copy_size = float(entries[2])
-                buffer_src_ptr = entries[3]
-                buffer_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    buffer_src_ptr = entries[3]
+                    buffer_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    buffer_src_ptr = entries[4]
+                    buffer_dst_ptr = entries[5]
                 copy_statistics.add_copy_buffer(copy_size, buffer_src_ptr, buffer_dst_ptr)
             elif entries[0] == 'copy_image' and is_frame_current:
-                copy_size = float(entries[2])
-                image_src_ptr = entries[3]
-                image_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    image_src_ptr = entries[3]
+                    image_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    image_src_ptr = entries[4]
+                    image_dst_ptr = entries[5]
                 copy_statistics.add_copy_image(copy_size, image_src_ptr, image_dst_ptr)
             elif entries[0] == 'copy_buffer_to_image' and is_frame_current:
-                copy_size = float(entries[2])
-                buffer_src_ptr = entries[3]
-                image_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    buffer_src_ptr = entries[3]
+                    image_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    buffer_src_ptr = entries[4]
+                    image_dst_ptr = entries[5]
                 copy_statistics.add_copy_buffer_to_image(copy_size, buffer_src_ptr, image_dst_ptr)
             elif entries[0] == 'copy_image_to_buffer' and is_frame_current:
-                copy_size = float(entries[2])
-                image_src_ptr = entries[3]
-                buffer_dst_ptr = entries[4]
+                if file_format_version == 0:
+                    copy_size = float(entries[2])
+                    image_src_ptr = entries[3]
+                    buffer_dst_ptr = entries[4]
+                else:
+                    copy_size = float(entries[3])
+                    image_src_ptr = entries[4]
+                    buffer_dst_ptr = entries[5]
                 copy_statistics.add_copy_image_to_buffer(copy_size, image_src_ptr, buffer_dst_ptr)
 
     print(f'Frame duration: {(frame_stop_timestamp - frame_start_timestamp) * 1e3}ms')

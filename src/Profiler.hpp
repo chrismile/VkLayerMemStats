@@ -1,0 +1,264 @@
+/*
+ * BSD 2-Clause License
+ *
+ * Copyright (c) 2026, Christoph Neuhauser
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ *   list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef VKLAYERMEMSTATS_PROFILER_HPP
+#define VKLAYERMEMSTATS_PROFILER_HPP
+
+#include <vector>
+#include <unordered_map>
+#include <cmath>
+#include <cstdint>
+
+enum class MemStatsLayerQueryType : uint32_t {
+    UNKNOWN,
+    COMMAND_BUFFER_SUBMISSION,
+    CMD_COPY_BUFFER, CMD_COPY_IMAGE, CMD_COPY_BUFFER_TO_IMAGE, CMD_COPY_IMAGE_TO_BUFFER,
+    CMD_DISPATCH, CMD_DISPATCH_INDIRECT,
+    CMD_DRAW, CMD_DRAW_INDIRECT, CMD_DRAW_INDIRECT_COUNT,
+    CMD_DRAW_INDEXED, CMD_DRAW_INDEXED_INDIRECT, CMD_DRAW_INDEXED_INDIRECT_COUNT,
+    CMD_DRAW_MESH_TASKS, CMD_DRAW_MESH_TASKS_INDIRECT,
+    CMD_TRACE_RAYS
+};
+
+static const char* const QUERY_TYPE_NAMES[] = {
+    "ERROR",
+    "command_buffer_submission",
+    "cmd_copy_buffer", "cmd_copy_image", "cmd_copy_buffer_to_image", "cmd_copy_image_to_buffer",
+    "cmd_dispatch", "cmd_dispatch_indirect",
+    "cmd_draw", "cmd_draw_indirect", "cmd_draw_indirect_count",
+    "cmd_draw_indexed", "cmd_draw_indexed_indirect", "cmd_draw_indexed_indirect_count",
+    "cmd_draw_mesh_tasks", "cmd_draw_mesh_tasks_indirect",
+    "cmd_trace_rays"
+};
+
+struct MemStatsLayer_Query {
+    MemStatsLayerQueryType queryType = MemStatsLayerQueryType::UNKNOWN;
+    uint64_t recordTimeStamp = 0;
+    uint64_t vulkanCommandIdx = 0;
+};
+
+struct MemStatsLayer_QueryAdder;
+
+struct MemStatsLayer_SubmitData {
+    MemStatsLayer_SubmitData(
+            VkDevice device,
+            PFN_vkCreateQueryPool pCreateQueryPool,
+            PFN_vkDestroyQueryPool pDestroyQueryPool,
+            PFN_vkResetQueryPool pResetQueryPool,
+            PFN_vkCmdResetQueryPool pCmdResetQueryPool,
+            PFN_vkGetQueryPoolResults pGetQueryPoolResults,
+            float timestampPeriod);
+    ~MemStatsLayer_SubmitData();
+    // Resets to initial state to be reused for next command buffer submit.
+    void reset();
+    // Reads back query data.
+    void readBack();
+
+    // Global data supplied by MemStatsLayer_Profiler.
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkCreateQueryPool pCreateQueryPool = nullptr;
+    PFN_vkDestroyQueryPool pDestroyQueryPool = nullptr;
+    PFN_vkResetQueryPool pResetQueryPool = nullptr;
+    PFN_vkCmdResetQueryPool pCmdResetQueryPool = nullptr;
+    PFN_vkGetQueryPoolResults pGetQueryPoolResults = nullptr;
+    float timestampPeriod = 1.0f;
+
+    // Query pool data.
+    bool submitted = false;
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    uint64_t* queryBuffer = nullptr;
+    uint64_t globalFrameIndex = 0;
+    uint64_t submitTimestamp = std::numeric_limits<uint64_t>::max();
+    std::shared_ptr<MemStatsLayer_QueryAdder> submissionQueryAdder{};
+    std::vector<MemStatsLayer_Query> queries;
+    const uint32_t maxNumQueries = 4096;
+    uint32_t numDirtyQueries = maxNumQueries;
+
+    // Data added by vkQueueSubmit.
+    VkQueue queue = VK_NULL_HANDLE;
+    VkFence fence;
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<uint64_t> waitSemaphoreValues;
+    std::vector<VkSemaphore> signalSemaphores;
+    std::vector<uint64_t> signalSemaphoreValues;
+};
+
+struct MemStatsLayer_Profiler {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkCreateQueryPool pCreateQueryPool = nullptr;
+    PFN_vkDestroyQueryPool pDestroyQueryPool = nullptr;
+    PFN_vkResetQueryPool pResetQueryPool = nullptr;
+    PFN_vkCmdResetQueryPool pCmdResetQueryPool = nullptr;
+    PFN_vkGetQueryPoolResults pGetQueryPoolResults = nullptr;
+    PFN_vkCmdWriteTimestamp pCmdWriteTimestamp = nullptr;
+    uint64_t currentFrameIndex = 0;
+    uint64_t commandIndex = 0;
+    bool supportsQueries = false;
+    float timestampPeriod = 1.0f;
+
+    const uint32_t maxNumSubmitsInFlight = 16;
+    std::unordered_map<VkCommandBuffer, MemStatsLayer_SubmitData*> submitsInFlight;
+    std::vector<MemStatsLayer_SubmitData*> freeSubmitDataList; /// New submit data gets added by @see MemStatsLayer_QueryAdder.
+};
+
+static std::map<void*, MemStatsLayer_Profiler*> profilerMap;
+
+inline MemStatsLayer_SubmitData::MemStatsLayer_SubmitData(
+        VkDevice device,
+        PFN_vkCreateQueryPool pCreateQueryPool,
+        PFN_vkDestroyQueryPool pDestroyQueryPool,
+        PFN_vkResetQueryPool pResetQueryPool,
+        PFN_vkCmdResetQueryPool pCmdResetQueryPool,
+        PFN_vkGetQueryPoolResults pGetQueryPoolResults,
+        float timestampPeriod)
+        : device(device),
+          pCreateQueryPool(pCreateQueryPool), pDestroyQueryPool(pDestroyQueryPool),
+          pResetQueryPool(pResetQueryPool), pCmdResetQueryPool(pCmdResetQueryPool),
+          pGetQueryPoolResults(pGetQueryPoolResults),
+          timestampPeriod(timestampPeriod) {
+    VkQueryPoolCreateInfo queryPoolCreateInfo = {};
+    queryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    queryPoolCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolCreateInfo.queryCount = maxNumQueries;
+    pCreateQueryPool(device, &queryPoolCreateInfo, nullptr, &queryPool);
+    //pResetQueryPool(device, queryPool, 0, maxNumQueries); // needs hostQueryReset
+
+    queryBuffer = new uint64_t[maxNumQueries];
+    queries.reserve(maxNumQueries);
+}
+
+inline MemStatsLayer_SubmitData::~MemStatsLayer_SubmitData() {
+    pDestroyQueryPool(device, queryPool, nullptr);
+    delete[] queryBuffer;
+}
+
+void MemStatsLayer_SubmitData::reset() {
+    queue = VK_NULL_HANDLE;
+    queries.clear();
+    submitted = false;
+    submitTimestamp = std::numeric_limits<uint64_t>::max();
+
+    fence = VK_NULL_HANDLE;
+    signalSemaphores.clear();
+    signalSemaphoreValues.clear();
+    waitSemaphores.clear();
+    waitSemaphoreValues.clear();
+}
+
+inline void MemStatsLayer_SubmitData::readBack() {
+    if (queries.empty()) {
+        return;
+    }
+    size_t numQueries = queries.size();
+
+    pGetQueryPoolResults(
+            device, queryPool, 0, static_cast<uint32_t>(numQueries) * 2,
+            numQueries * 2 * sizeof(uint64_t), queryBuffer, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    //pResetQueryPool(device, queryPool, 0, maxNumQueries); // needs hostQueryReset
+
+    for (size_t queryIdx = 0; queryIdx < numQueries; ++queryIdx) {
+        auto& query = queries[queryIdx];
+        uint64_t startTimestamp = queryBuffer[queryIdx * 2];
+        uint64_t endTimestamp = queryBuffer[queryIdx * 2 + 1];
+        auto executionTimeNanoseconds = static_cast<uint64_t>(std::round(
+                double(endTimestamp - startTimestamp) * timestampPeriod));
+        fprintf_save(MemStatsLayer_outFile,
+                "profiler_event,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
+                query.recordTimeStamp, getTimeStamp(), query.vulkanCommandIdx, executionTimeNanoseconds,
+                globalFrameIndex, QUERY_TYPE_NAMES[static_cast<int>(query.queryType)]);
+    }
+    numDirtyQueries = static_cast<uint32_t>(queries.size()) * 2;
+}
+
+struct MemStatsLayer_QueryAdder {
+public:
+    MemStatsLayer_QueryAdder(VkCommandBuffer commandBuffer, MemStatsLayerQueryType queryType);
+    ~MemStatsLayer_QueryAdder();
+    bool isValid = false;
+    uint32_t queryEndIdx = 0;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    MemStatsLayer_SubmitData* submitData = nullptr;
+};
+
+MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
+        VkCommandBuffer commandBuffer, MemStatsLayerQueryType queryType) : commandBuffer(commandBuffer) {
+    const auto& settings = deviceLayerSettings[getDispatchKey(commandBuffer)];
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+
+    if (settings.useProfiler && profiler->supportsQueries) {
+        auto it = profiler->submitsInFlight.find(commandBuffer);
+        if (it == profiler->submitsInFlight.end()) {
+            if (profiler->freeSubmitDataList.empty()) {
+                if (profiler->submitsInFlight.size() > profiler->maxNumSubmitsInFlight) {
+                    std::cerr << "[VkLayer_memstats] Exceeded maximum number of submits in flight." << std::endl;
+                    return;
+                }
+                auto* submitData = new MemStatsLayer_SubmitData(
+                        profiler->device,
+                        profiler->pCreateQueryPool, profiler->pDestroyQueryPool,
+                        profiler->pResetQueryPool, profiler->pCmdResetQueryPool,
+                        profiler->pGetQueryPoolResults,
+                        profiler->timestampPeriod);
+                profiler->freeSubmitDataList.push_back(submitData);
+            }
+            auto* frameDataNew = profiler->freeSubmitDataList.back();
+            frameDataNew->globalFrameIndex = profiler->currentFrameIndex;
+            profiler->freeSubmitDataList.pop_back();
+            profiler->pCmdResetQueryPool(commandBuffer, frameDataNew->queryPool, 0, frameDataNew->numDirtyQueries);
+            it = profiler->submitsInFlight.insert(std::make_pair(commandBuffer, frameDataNew)).first;
+        }
+        submitData = it->second;
+        auto numQueries = static_cast<uint32_t>(submitData->queries.size()) * 2;
+        if (numQueries <= submitData->maxNumQueries) {
+            MemStatsLayer_Query query{};
+            query.queryType = queryType;
+            query.recordTimeStamp = getTimeStamp();
+            query.vulkanCommandIdx = profiler->commandIndex - 1;
+            submitData->queries.push_back(query);
+            profiler->pCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, submitData->queryPool, numQueries);
+            queryPool = submitData->queryPool;
+            queryEndIdx = numQueries + 1;
+            isValid = true;
+        } else {
+            std::cerr << "[VkLayer_memstats] Exceeded maximum number of timestamp queries." << std::endl;
+        }
+    }
+}
+
+MemStatsLayer_QueryAdder::~MemStatsLayer_QueryAdder() {
+    if (isValid) {
+        auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+        profiler->pCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, queryEndIdx);
+    }
+}
+
+#define PROFILER_CREATE_QUERY(commandBuffer, queryType) MemStatsLayer_QueryAdder queryAdder(commandBuffer, queryType);
+
+#endif //VKLAYERMEMSTATS_PROFILER_HPP

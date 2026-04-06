@@ -119,12 +119,23 @@ During tests, and unlike for Linux, not preloading did not lead to crashes. Howe
 allocations and deallocations will only start to be tracked when the Vulkan loader loads the layer library.
 Please note that currently, the preloading application is not yet available with MinHook builds.
 
+
+## Profiler (experimental)
+
+To enable the experimental Vulkan profiler, export the additional environment variable `VK_PROFILER=1`.
+The profiler assumes that only primary command buffers (`VK_COMMAND_BUFFER_LEVEL_PRIMARY`) are used and command buffers
+are either used transiently or at least reset before every reuse (`VK_COMMAND_POOL_CREATE_TRANSIENT_BIT` and/or
+`VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT`).
+
+
 ## File output format
 
 When using the layer, memory statistics will be dumped to a file memstats.csv.
 One line of the file contains one data record. Individual entries are separated by commas.
 
 The first entry denotes the type of the record. The second entry is always a timestamp in nanoseconds.
+- An entry starting with `version` denotes the version of the output format.
+  Additional entries: Integer version (currently 1).
 - An entry starting with `alloc` denotes a memory allocation.
   Additional entries: Type (CPU = 0, GPU = 1), size in bytes, pointer
   Optional entries: Memory type index (only for GPU)
@@ -138,6 +149,7 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Type index, heap index, property flags
 - An entry starting with `submit` is written when `vkQueueSubmit` is called.
 - An entry starting with `acquire_next_image` is written when `vkAcquireNextImageKHR` is called.
+- An entry starting with `present` is written when `vkQueuePresentKHR` is called.
 - An entry starting with `bind_buffer_memory` is written when `vkBindBufferMemory` is called.
   Additional entries: Buffer pointer, memory pointer, memory offset.
 - An entry starting with `bind_image_memory` is written when `vkBindImageMemory` is called.
@@ -146,14 +158,33 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Buffer pointer.
 - An entry starting with `destroy_image` is written when `vkDestroyImage` is called.
   Additional entries: Image pointer.
+- An entry starting with `begin_command_buffer` is written when `vkBeginCommandBuffer` is called.
+  Additional entries: Command index.
+- An entry starting with `end_command_buffer` is written when `vkEndCommandBuffer` is called.
+  Additional entries: Command index.
 - An entry starting with `copy_buffer` is written when `vkCmdCopyBuffer` is called.
-  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
 - An entry starting with `copy_image` is written when `vkCmdCopyImage` is called.
-  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
 - An entry starting with `copy_buffer_to_image` is written when `vkCmdCopyBufferToImage` is called.
-  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
 - An entry starting with `copy_image_to_buffer` is written when `vkCmdCopyImageToBuffer` is called.
-  Additional entries: Copy size in bytes, source buffer pointer, destination buffer pointer.
+  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
+- An entry starting with `dispatch` is written when `vkCmdDispatch` is called.
+  Additional entries: Command index.
+- An entry starting with `dispatch_indirect` is written when `vkCmdDispatchIndirect` is called.
+  Additional entries: Command index.
+- An entry starting with `profiler_event` records how long a device command took.
+  This command takes two timestamps. The first is the record timestamp, the second the readback time stamp.
+  Additional entries: Readback timestamp, command index, device execution time in nanoseconds, frame index, event name.
+
+
+# Version history
+
+Version 1:
+- New records: `version`, `profiler_event`
+- Backwards incompatible changes: `copy_buffer`, `copy_image`, `copy_buffer_to_image` and `copy_image_to_buffer`
+  now take a device global command index as the first argument that `profiler_event` can reference.
 
 
 # Future considerations
