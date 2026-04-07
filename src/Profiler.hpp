@@ -37,7 +37,7 @@
 enum class MemStatsLayerQueryType : uint32_t {
     UNKNOWN,
     COMMAND_BUFFER_SUBMISSION,
-    CMD_COPY_BUFFER, CMD_COPY_IMAGE, CMD_COPY_BUFFER_TO_IMAGE, CMD_COPY_IMAGE_TO_BUFFER,
+    CMD_UPDATE_BUFFER, CMD_COPY_BUFFER, CMD_COPY_IMAGE, CMD_COPY_BUFFER_TO_IMAGE, CMD_COPY_IMAGE_TO_BUFFER,
     CMD_DISPATCH, CMD_DISPATCH_INDIRECT,
     CMD_DRAW, CMD_DRAW_INDIRECT, CMD_DRAW_INDIRECT_COUNT,
     CMD_DRAW_INDEXED, CMD_DRAW_INDEXED_INDIRECT, CMD_DRAW_INDEXED_INDIRECT_COUNT,
@@ -48,7 +48,7 @@ enum class MemStatsLayerQueryType : uint32_t {
 static const char* const QUERY_TYPE_NAMES[] = {
     "ERROR",
     "command_buffer_submission",
-    "cmd_copy_buffer", "cmd_copy_image", "cmd_copy_buffer_to_image", "cmd_copy_image_to_buffer",
+    "cmd_update_buffer", "cmd_copy_buffer", "cmd_copy_image", "cmd_copy_buffer_to_image", "cmd_copy_image_to_buffer",
     "cmd_dispatch", "cmd_dispatch_indirect",
     "cmd_draw", "cmd_draw_indirect", "cmd_draw_indirect_count",
     "cmd_draw_indexed", "cmd_draw_indexed_indirect", "cmd_draw_indexed_indirect_count",

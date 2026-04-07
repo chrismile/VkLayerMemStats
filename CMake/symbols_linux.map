@@ -3,6 +3,7 @@ global:
     /* Export Vulkan symbols for loader. */
     MemStatsLayer_GetInstanceProcAddr;
     MemStatsLayer_GetDeviceProcAddr;
+    memstats_printf;
     malloc;
     free;
     calloc;

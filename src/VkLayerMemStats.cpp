@@ -39,7 +39,9 @@
 #include <memory>
 #include <algorithm>
 #include <mutex>
+#include <cstdio>
 #include <cstring>
+#include <cstdarg>
 #include <cctype>
 #include <cinttypes>
 #include <vulkan/vk_layer.h>
@@ -55,7 +57,6 @@
 #define NOMINMAX
 #endif
 
-#include <cstdarg>
 #include <windows.h>
 #include <strsafe.h>
 
@@ -69,7 +70,6 @@
 
 #else // defined(HOOK_MALLOC) && !defined(_WIN32)
 
-#include <cstdio>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -186,15 +186,13 @@ enum class AllocType {
  * - In case we ever would need to reimplement itoa as well (luckily seems to not be necessary), we could use
  *   https://gist.github.com/7h3w4lk3r/3f0ac29713b11ad01c8cd2894550d2c9 as a reference.
  */
-static void fprintf_save(FILE* stream, const char* format, ...) {
+static void vfprintf_save(FILE* file, const char* format, va_list vlist) {
     static_assert(sizeof(void*) == sizeof(uint64_t));
 
     char buffer[4096];
     char temp[32]; // largest uint64 value has 21 digits (+ some spare space for hex, sign, ...)
     int fmtPos = 0, bufPos = 0;
 
-    va_list vlist;
-    va_start(vlist, format);
     while (format[fmtPos] != '\0' && bufPos < sizeof(buffer)) {
         if (format[fmtPos] == '%') {
             fmtPos++;
@@ -252,10 +250,15 @@ static void fprintf_save(FILE* stream, const char* format, ...) {
         }
         fmtPos++;
     }
-    va_end(vlist);
 
     // Seems to not allocate heap memory via the CRT, but otherwise we could try the WinAPI function WriteFile.
-    fwrite(buffer, 1, bufPos, stream);
+    fwrite(buffer, 1, bufPos, file);
+}
+inline void fprintf_save(FILE* file, const char* format, ...) {
+    va_list vlist;
+    va_start(vlist, format);
+    vfprintf_save(file, format, vlist);
+    va_end(vlist);
 }
 #else
 /**
@@ -264,6 +267,7 @@ static void fprintf_save(FILE* stream, const char* format, ...) {
  * Still, in the long run, it may also make sense to avoid heap memory allocations and use the Windows function above.
  */
 #define fprintf_save fprintf
+#define vfprintf_save vfprintf
 #endif
 
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
@@ -280,6 +284,15 @@ static void fprintf_save(FILE* stream, const char* format, ...) {
     fprintf_save(__VA_ARGS__); \
     RELEASE_ALLOC();
 #endif
+
+VK_LAYER_EXPORT void memstats_printf(const char* format, ...) {
+    ACQUIRE_ALLOC();
+    va_list vlist;
+    va_start(vlist, format);
+    vfprintf_save(MemStatsLayer_outFile, format, vlist);
+    va_end(vlist);
+    RELEASE_ALLOC();
+}
 
 
 
@@ -506,6 +519,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.DestroyImage = (PFN_vkDestroyImage)pGetDeviceProcAddr(*pDevice, "vkDestroyImage");
     dispatchTable.BeginCommandBuffer = (PFN_vkBeginCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
     dispatchTable.EndCommandBuffer = (PFN_vkEndCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkEndCommandBuffer");
+    dispatchTable.CmdUpdateBuffer = (PFN_vkCmdUpdateBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdUpdateBuffer");
     dispatchTable.CmdCopyBuffer = (PFN_vkCmdCopyBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer");
     dispatchTable.CmdCopyImage = (PFN_vkCmdCopyImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImage");
     dispatchTable.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage");
@@ -710,6 +724,22 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EndCommandBuffer(Vk
     return deviceDispatchTables[getDispatchKey(commandBuffer)].EndCommandBuffer(commandBuffer);
 }
 
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdUpdateBuffer(
+        VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSize dstOffset, VkDeviceSize dataSize,
+        const void* pData) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = dataSize;
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "update_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%p\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, dstBuffer);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_UPDATE_BUFFER);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdUpdateBuffer(
+            commandBuffer, dstBuffer, dstOffset, dataSize, pData);
+}
 
 VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer(
         VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkBuffer dstBuffer, uint32_t regionCount,
@@ -1165,6 +1195,7 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetDevice
     GETPROCADDR_VK(DestroyImage);
     GETPROCADDR_VK(BeginCommandBuffer);
     GETPROCADDR_VK(EndCommandBuffer);
+    GETPROCADDR_VK(CmdUpdateBuffer);
     GETPROCADDR_VK(CmdCopyBuffer);
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);
@@ -1211,6 +1242,7 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
     GETPROCADDR_VK(DestroyImage);
     GETPROCADDR_VK(BeginCommandBuffer);
     GETPROCADDR_VK(EndCommandBuffer);
+    GETPROCADDR_VK(CmdUpdateBuffer);
     GETPROCADDR_VK(CmdCopyBuffer);
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);

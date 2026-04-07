@@ -162,6 +162,8 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Command index.
 - An entry starting with `end_command_buffer` is written when `vkEndCommandBuffer` is called.
   Additional entries: Command index.
+- An entry starting with `update_buffer` is written when `vkCmdUpdateBuffer` is called.
+  Additional entries: Command index, copy size in bytes, destination buffer pointer.
 - An entry starting with `copy_buffer` is written when `vkCmdCopyBuffer` is called.
   Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
 - An entry starting with `copy_image` is written when `vkCmdCopyImage` is called.

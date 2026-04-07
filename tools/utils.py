@@ -70,6 +70,10 @@ class CopyStatistics:
     def destroy_image(self, image_ptr):
         del self.gpu_image_ptr_to_alloc_ptr_map[image_ptr]
 
+    def add_update_buffer(self, copy_size, buffer_dst_ptr):
+        mem_type_dst = self.gpu_mem_ptr_to_type_map[self.gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]
+        self.add_memcpy(copy_size, MemoryProperty.HOST_VISIBLE_BIT, mem_type_dst, True, True)
+
     def add_copy_buffer(self, copy_size, buffer_src_ptr, buffer_dst_ptr):
         mem_type_src = self.gpu_mem_ptr_to_type_map[self.gpu_buffer_ptr_to_alloc_ptr_map[buffer_src_ptr]]
         mem_type_dst = self.gpu_mem_ptr_to_type_map[self.gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]

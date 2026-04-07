@@ -192,6 +192,11 @@ def main():
                 del gpu_buffer_ptr_to_alloc_ptr_map[entries[2]]
             elif entries[0] == 'destroy_image':
                 del gpu_image_ptr_to_alloc_ptr_map[entries[2]]
+            elif entries[0] == 'update_buffer':
+                copy_size = float(entries[3])
+                buffer_dst_ptr = entries[4]
+                mem_type_dst = gpu_mem_ptr_to_type_map[gpu_buffer_ptr_to_alloc_ptr_map[buffer_dst_ptr]]
+                add_memcpy(copy_size, MemoryProperty.HOST_VISIBLE_BIT, mem_type_dst)
             elif entries[0] == 'copy_buffer':
                 if file_format_version == 0:
                     copy_size = float(entries[2])

@@ -107,6 +107,10 @@ def main():
                 copy_statistics.destroy_buffer(entries[2])
             elif entries[0] == 'destroy_image':
                 copy_statistics.destroy_image(entries[2])
+            elif entries[0] == 'update_buffer' and is_frame_current:
+                copy_size = float(entries[3])
+                buffer_dst_ptr = entries[4]
+                copy_statistics.add_update_buffer(copy_size, buffer_dst_ptr)
             elif entries[0] == 'copy_buffer' and is_frame_current:
                 if file_format_version == 0:
                     copy_size = float(entries[2])
