@@ -38,15 +38,17 @@
 #endif
 
 MEMSTATS_EXPORT void memstats_printf(const char* format, ...);
+MEMSTATS_EXPORT uint64_t memstats_gettimestamp();
 
 #else // !defined(MEMSTATS_LINK_TIME)
 
 extern void (*memstats_printf)(const char* format, ...);
+extern uint64_t (*memstats_gettimestamp)();
 
-#define MEMSTATS_IMPL
 #ifdef MEMSTATS_IMPL
 
 void (*memstats_printf)(const char* format, ...) = nullptr;
+uint64_t (*memstats_gettimestamp)() = nullptr;
 
 #include <vector>
 #include <string>
@@ -92,6 +94,7 @@ void MemStatsLayer_splitString(const std::string& stringObject, char separator, 
 
 static bool memstats_load() {
     typedef void ( *PFN_memstats_printf )( const char* format, ... );
+    typedef void ( *PFN_memstats_gettimestamp )( const char* format, ... );
 
     std::vector<std::string> pathList;
 #ifdef _MSC_VER
@@ -118,7 +121,7 @@ static bool memstats_load() {
 #endif
 
 #if defined(__linux__)
-    HMODULE g_memstatsLibrary = dlopen("libVkLayer_memstats.so", RTLD_NOW | RTLD_LOCAL);
+    g_memstatsLibrary = dlopen("libVkLayer_memstats.so", RTLD_NOW | RTLD_LOCAL);
     if (!g_memstatsLibrary) {
         for (const std::string& path : pathList) {
             std::string libraryPath = path;
@@ -136,7 +139,7 @@ static bool memstats_load() {
         }
     }
 #elif defined(_WIN32)
-    void* g_memstatsLibrary = LoadLibraryA("VkLayer_memstats.dll");
+    g_memstatsLibrary = LoadLibraryA("VkLayer_memstats.dll");
     if (!g_memstatsLibrary) {
         for (const std::string& path : pathList) {
             std::string libraryPath = path;
@@ -156,11 +159,14 @@ static bool memstats_load() {
 #endif
 
     memstats_printf = PFN_memstats_printf(dlsym(g_memstatsLibrary, "memstats_printf"));
+    memstats_gettimestamp = PFN_memstats_gettimestamp(dlsym(g_memstatsLibrary, "memstats_gettimestamp"));
+
     return true;
 }
 
 static void memstats_unload() {
     memstats_printf = nullptr;
+    memstats_gettimestamp = nullptr;
 
 #if defined(__linux__)
     dlclose(g_memstatsLibrary);

@@ -294,6 +294,10 @@ VK_LAYER_EXPORT void memstats_printf(const char* format, ...) {
     RELEASE_ALLOC();
 }
 
+VK_LAYER_EXPORT uint64_t memstats_gettimestamp() {
+    return getTimeStamp();
+}
+
 
 
 #include "Profiler.hpp"

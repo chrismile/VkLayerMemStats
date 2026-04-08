@@ -4,6 +4,7 @@ global:
     MemStatsLayer_GetInstanceProcAddr;
     MemStatsLayer_GetDeviceProcAddr;
     memstats_printf;
+    memstats_gettimestamp;
     malloc;
     free;
     calloc;
