@@ -29,6 +29,8 @@
 #ifndef VKLAYERMEMSTATS_MEMSTATS_H
 #define VKLAYERMEMSTATS_MEMSTATS_H
 
+#include <cstdint>
+
 #ifdef MEMSTATS_LINK_TIME
 
 #ifdef _WIN32
@@ -94,7 +96,7 @@ void MemStatsLayer_splitString(const std::string& stringObject, char separator, 
 
 static bool memstats_load() {
     typedef void ( *PFN_memstats_printf )( const char* format, ... );
-    typedef void ( *PFN_memstats_gettimestamp )( const char* format, ... );
+    typedef uint64_t ( *PFN_memstats_gettimestamp )();
 
     std::vector<std::string> pathList;
 #ifdef _MSC_VER
