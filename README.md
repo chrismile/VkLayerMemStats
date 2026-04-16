@@ -189,6 +189,17 @@ Version 1:
   now take a device global command index as the first argument that `profiler_event` can reference.
 
 
+# Application-specific logging
+
+The library provides an interface for custom application-specific logging if source access is available.
+Please place `src/memstats.h` somewhere the application source code can find and include it.
+1. Call `memstats_load()` at the application startup (after the Vulkan instance has been created if not intercepting
+   CPU allocations).
+2. Call `memstats_printf()` to do app-specific logging. `memstats_gettimestamp` can be used to get the same timestamp
+   that is also used internally by the library as the record argument in `memstats.csv`.
+3. Call `memstats_load()` at application shutdown.
+
+
 # Future considerations
 
 - We could use similar code like
