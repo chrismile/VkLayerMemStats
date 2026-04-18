@@ -41,8 +41,8 @@ enum class MemStatsLayerQueryType : uint32_t {
     CMD_DISPATCH, CMD_DISPATCH_INDIRECT,
     CMD_DRAW, CMD_DRAW_INDIRECT, CMD_DRAW_INDIRECT_COUNT,
     CMD_DRAW_INDEXED, CMD_DRAW_INDEXED_INDIRECT, CMD_DRAW_INDEXED_INDIRECT_COUNT,
-    CMD_DRAW_MESH_TASKS, CMD_DRAW_MESH_TASKS_INDIRECT,
-    CMD_TRACE_RAYS
+    CMD_DRAW_MESH_TASKS, CMD_DRAW_MESH_TASKS_INDIRECT, CMD_DRAW_MESH_TASKS_INDIRECT_COUNT,
+    CMD_TRACE_RAYS, CMD_TRACE_RAYS_INDIRECT
 };
 
 static const char* const QUERY_TYPE_NAMES[] = {
@@ -52,8 +52,8 @@ static const char* const QUERY_TYPE_NAMES[] = {
     "cmd_dispatch", "cmd_dispatch_indirect",
     "cmd_draw", "cmd_draw_indirect", "cmd_draw_indirect_count",
     "cmd_draw_indexed", "cmd_draw_indexed_indirect", "cmd_draw_indexed_indirect_count",
-    "cmd_draw_mesh_tasks", "cmd_draw_mesh_tasks_indirect",
-    "cmd_trace_rays"
+    "cmd_draw_mesh_tasks", "cmd_draw_mesh_tasks_indirect", "cmd_draw_mesh_tasks_indirect_count",
+    "cmd_trace_rays", "cmd_trace_rays_indirect"
 };
 
 struct MemStatsLayer_Query {
@@ -72,6 +72,7 @@ struct MemStatsLayer_SubmitData {
             PFN_vkResetQueryPool pResetQueryPool,
             PFN_vkCmdResetQueryPool pCmdResetQueryPool,
             PFN_vkGetQueryPoolResults pGetQueryPoolResults,
+            PFN_vkGetCalibratedTimestampsKHR pGetCalibratedTimestampsKHR,
             float timestampPeriod);
     ~MemStatsLayer_SubmitData();
     // Resets to initial state to be reused for next command buffer submit.
@@ -86,6 +87,7 @@ struct MemStatsLayer_SubmitData {
     PFN_vkResetQueryPool pResetQueryPool = nullptr;
     PFN_vkCmdResetQueryPool pCmdResetQueryPool = nullptr;
     PFN_vkGetQueryPoolResults pGetQueryPoolResults = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR pGetCalibratedTimestampsKHR = nullptr;
     float timestampPeriod = 1.0f;
 
     // Query pool data.
@@ -102,7 +104,7 @@ struct MemStatsLayer_SubmitData {
     // Data added by vkQueueSubmit.
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
-    VkFence fence;
+    VkFence fence = VK_NULL_HANDLE;
     std::vector<VkSemaphore> waitSemaphores;
     std::vector<uint64_t> waitSemaphoreValues;
     std::vector<VkSemaphore> signalSemaphores;
@@ -117,6 +119,7 @@ struct MemStatsLayer_Profiler {
     PFN_vkCmdResetQueryPool pCmdResetQueryPool = nullptr;
     PFN_vkGetQueryPoolResults pGetQueryPoolResults = nullptr;
     PFN_vkCmdWriteTimestamp pCmdWriteTimestamp = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR pGetCalibratedTimestampsKHR = nullptr;
     uint64_t currentFrameIndex = 0;
     uint64_t commandIndex = 0;
     bool supportsQueries = false;
@@ -144,11 +147,12 @@ inline MemStatsLayer_SubmitData::MemStatsLayer_SubmitData(
         PFN_vkResetQueryPool pResetQueryPool,
         PFN_vkCmdResetQueryPool pCmdResetQueryPool,
         PFN_vkGetQueryPoolResults pGetQueryPoolResults,
+        PFN_vkGetCalibratedTimestampsKHR pGetCalibratedTimestampsKHR,
         float timestampPeriod)
         : device(device),
           pCreateQueryPool(pCreateQueryPool), pDestroyQueryPool(pDestroyQueryPool),
           pResetQueryPool(pResetQueryPool), pCmdResetQueryPool(pCmdResetQueryPool),
-          pGetQueryPoolResults(pGetQueryPoolResults),
+          pGetQueryPoolResults(pGetQueryPoolResults), pGetCalibratedTimestampsKHR(pGetCalibratedTimestampsKHR),
           timestampPeriod(timestampPeriod) {
     VkQueryPoolCreateInfo queryPoolCreateInfo = {};
     queryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -191,17 +195,43 @@ inline void MemStatsLayer_SubmitData::readBack() {
             numQueries * 2 * sizeof(uint64_t), queryBuffer, sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     //pResetQueryPool(device, queryPool, 0, maxNumQueries); // needs hostQueryReset
+    auto readBackTimeStamp = getTimeStamp();
+
+    uint64_t calibratedTimestamps[2];
+    uint64_t maxDeviationNs = 0;
+    VkCalibratedTimestampInfoKHR calibratedTimestampInfos[2];
+    VkCalibratedTimestampInfoKHR& calibratedTimestampInfoDevice = calibratedTimestampInfos[0];
+    calibratedTimestampInfoDevice.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    calibratedTimestampInfoDevice.pNext = nullptr;
+    calibratedTimestampInfoDevice.timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+    VkCalibratedTimestampInfoKHR& calibratedTimestampInfoHost = calibratedTimestampInfos[1];
+    calibratedTimestampInfoHost.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    calibratedTimestampInfoHost.pNext = nullptr;
+#ifdef _WIN32
+    calibratedTimestampInfoHost.timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+    calibratedTimestampInfoHost.timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+    auto res = pGetCalibratedTimestampsKHR(device, 2, calibratedTimestampInfos, calibratedTimestamps, &maxDeviationNs);
+    if (res != VK_SUCCESS) {
+        std::cerr << "[VkLayer_memstats] vkGetCalibratedTimestampsKHR failed." << std::endl;
+    }
 
     for (size_t queryIdx = 0; queryIdx < numQueries; ++queryIdx) {
         auto& query = queries[queryIdx];
-        uint64_t startTimestamp = queryBuffer[queryIdx * 2];
-        uint64_t endTimestamp = queryBuffer[queryIdx * 2 + 1];
+        uint64_t startTimestampDevice = queryBuffer[queryIdx * 2];
+        uint64_t stopTimestampDevice = queryBuffer[queryIdx * 2 + 1];
         auto executionTimeNanoseconds = static_cast<uint64_t>(std::round(
-                double(endTimestamp - startTimestamp) * timestampPeriod));
+                double(stopTimestampDevice - startTimestampDevice) * timestampPeriod));
+        auto executionStartTimeStamp = deviceTimeStampToHostTimeStamp(
+                startTimestampDevice, timestampPeriod, calibratedTimestamps[0], calibratedTimestamps[1]);
+        auto executionStopTimeStamp = deviceTimeStampToHostTimeStamp(
+                stopTimestampDevice, timestampPeriod, calibratedTimestamps[0], calibratedTimestamps[1]);
         fprintf_save(MemStatsLayer_outFile,
-                "profiler_event,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
-                query.recordTimeStamp, getTimeStamp(), query.vulkanCommandIdx, executionTimeNanoseconds,
-                globalFrameIndex, QUERY_TYPE_NAMES[static_cast<int>(query.queryType)]);
+                "profiler_event,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
+                query.recordTimeStamp, readBackTimeStamp, executionStartTimeStamp, executionStopTimeStamp,
+                executionTimeNanoseconds, query.vulkanCommandIdx, globalFrameIndex,
+                QUERY_TYPE_NAMES[static_cast<int>(query.queryType)]);
     }
     numDirtyQueries = static_cast<uint32_t>(queries.size()) * 2;
 }
@@ -235,6 +265,7 @@ MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
                         profiler->pCreateQueryPool, profiler->pDestroyQueryPool,
                         profiler->pResetQueryPool, profiler->pCmdResetQueryPool,
                         profiler->pGetQueryPoolResults,
+                        profiler->pGetCalibratedTimestampsKHR,
                         profiler->timestampPeriod);
                 profiler->freeSubmitDataList.push_back(submitData);
             }
@@ -266,7 +297,7 @@ MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
 MemStatsLayer_QueryAdder::~MemStatsLayer_QueryAdder() {
     if (isValid) {
         auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
-        profiler->pCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, queryEndIdx);
+        profiler->pCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, queryEndIdx);
     }
 }
 

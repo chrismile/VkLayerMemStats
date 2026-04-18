@@ -177,8 +177,10 @@ The first entry denotes the type of the record. The second entry is always a tim
 - An entry starting with `dispatch_indirect` is written when `vkCmdDispatchIndirect` is called.
   Additional entries: Command index.
 - An entry starting with `profiler_event` records how long a device command took.
-  This command takes two timestamps. The first is the record timestamp, the second the readback time stamp.
-  Additional entries: Readback timestamp, command index, device execution time in nanoseconds, frame index, event name.
+  This command takes four timestamps. The first is the record timestamp, the second the readback timestamp,
+  the third the device execution start timestamp, the fourth the device execution stop timestamp.
+  Additional entries: Readback timestamp, execution start timestamp, execution stop timestamp,
+  device execution time in nanoseconds, command index, frame index, event name.
 
 
 # Version history
@@ -187,6 +189,11 @@ Version 1:
 - New records: `version`, `profiler_event`
 - Backwards incompatible changes: `copy_buffer`, `copy_image`, `copy_buffer_to_image` and `copy_image_to_buffer`
   now take a device global command index as the first argument that `profiler_event` can reference.
+
+- Version 2:
+- Backwards incompatible changes: `profiler_event` was updated to include device timings. Old description:
+  "This command takes two timestamps. The first is the record timestamp, the second the readback time stamp.
+  Additional entries: Readback timestamp, command index, device execution time in nanoseconds, frame index, event name."
 
 
 # Application-specific logging
