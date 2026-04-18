@@ -52,13 +52,15 @@
 
 #define FILE_FORMAT_VERSION_NUMBER 2
 
-#ifdef HOOK_MALLOC
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-
 #include <windows.h>
+#endif
+
+#ifdef HOOK_MALLOC
+#ifdef _WIN32
 #include <strsafe.h>
 
 #ifdef USE_DETOURS
