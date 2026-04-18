@@ -50,7 +50,7 @@
 #include <vulkan/layer/vk_layer_settings.h>
 #include <vulkan/layer/vk_layer_settings.hpp>
 
-#define FILE_FORMAT_VERSION_NUMBER 2
+#define FILE_FORMAT_VERSION_NUMBER 1
 
 #ifdef _WIN32
 #ifndef NOMINMAX

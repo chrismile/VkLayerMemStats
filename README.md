@@ -190,11 +190,6 @@ Version 1:
 - Backwards incompatible changes: `copy_buffer`, `copy_image`, `copy_buffer_to_image` and `copy_image_to_buffer`
   now take a device global command index as the first argument that `profiler_event` can reference.
 
-- Version 2:
-- Backwards incompatible changes: `profiler_event` was updated to include device timings. Old description:
-  "This command takes two timestamps. The first is the record timestamp, the second the readback time stamp.
-  Additional entries: Readback timestamp, command index, device execution time in nanoseconds, frame index, event name."
-
 
 # Application-specific logging
 
