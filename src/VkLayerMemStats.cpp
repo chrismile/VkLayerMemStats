@@ -236,114 +236,7 @@ enum class AllocType {
     CPU = 0, GPU = 1
 };
 
-#if defined(_WIN32) && defined(HOOK_MALLOC)
-/**
- * The MSVC CRT seems to have a heap lock in the debug libraries.
- * This means that a deadlock will occur when calling the "malloc" or "new" in the hooked memory allocation functions.
- * fprintf may do dynamic memory allocations. So replace this with stack-only allocations on Windows.
- * - vsnprintf and StringCbVPrintfExA are not an option, as it does CRT allocations.
- * - wvsprintfA is not an option, as it is heavily limited (missing certain format types.
- * So, we reimplement vsnprintf with support for the following formats:
- * - %s: String
- * - %c: Char
- * - %d: Signed int
- * - %u: Unsigned int
- * - %llu: Unsigned 64-bit int
- * - %p: Pointer (assumes 64-bit pointer size)
- * Further reads on Windows heap allocation handling for those interested:
- * - https://docs.microsoft.com/en-us/windows/win32/memory/heap-functions
- * - https://learn.microsoft.com/en-us/windows/win32/memory/comparing-memory-allocation-methods
- * - For debug, we could use: https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/crtsetallochook?view=msvc-170
- * - One person at least seems to also have successfully hooked new/malloc/delete/free:
- *   https://stackoverflow.com/questions/59579670/why-hooking-heapfree-with-detours-not-working-for-delete-free
- * - In case we ever would need to reimplement itoa as well (luckily seems to not be necessary), we could use
- *   https://gist.github.com/7h3w4lk3r/3f0ac29713b11ad01c8cd2894550d2c9 as a reference.
- */
-static void vfprintf_save(FILE* file, const char* format, va_list vlist) {
-    static_assert(sizeof(void*) == sizeof(uint64_t));
-
-    char buffer[4096];
-    char temp[32]; // largest uint64 value has 21 digits (+ some spare space for hex, sign, ...)
-    int fmtPos = 0, bufPos = 0;
-
-    while (format[fmtPos] != '\0' && bufPos < static_cast<int>(sizeof(buffer))) {
-        if (format[fmtPos] == '%') {
-            fmtPos++;
-            if (format[fmtPos] == 's') {
-                // String
-                const char* str = va_arg(vlist, const char*);
-                while (*str != '\0' && bufPos < static_cast<int>(sizeof(buffer))) {
-                    buffer[bufPos++] = *str++;
-                }
-            } else if (format[fmtPos] == 'c') {
-                // Char
-                buffer[bufPos++] = static_cast<char>(va_arg(vlist, int));
-            } else if (format[fmtPos] == 'd') {
-                // Signed integer
-                int num = va_arg(vlist, int);
-                _itoa_s(num, temp, _countof(temp), 10);
-                for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
-                    buffer[bufPos++] = temp[i];
-                }
-            } else if (format[fmtPos] == 'u') {
-                // Unsigned 32-bit integer
-                unsigned long num = va_arg(vlist, unsigned long);
-                _ultoa_s(num, temp, _countof(temp), 10);
-                for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
-                    buffer[bufPos++] = temp[i];
-                }
-            } else if (format[fmtPos] == 'l' && format[fmtPos + 1] == 'l' && format[fmtPos + 2] == 'u') {
-                // Unsigned 64-bit integer
-                fmtPos += 2;
-                uint64_t num = va_arg(vlist, uint64_t);
-                _ui64toa_s(num, temp, _countof(temp), 10);
-                for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
-                    buffer[bufPos++] = temp[i];
-                }
-            } else if (format[fmtPos] == 'p') {
-                // Pointer
-                void* ptr = va_arg(vlist, void*);
-                _ui64toa_s(reinterpret_cast<uint64_t>(ptr), temp, _countof(temp), 16);
-                int pointerStringLength;
-                for (pointerStringLength = 0; temp[pointerStringLength] != 0; pointerStringLength++) {
-                }
-                for (int i = pointerStringLength; i < 16 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
-                    buffer[bufPos++] = '0';
-                }
-                for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
-                    buffer[bufPos++] = temp[i];
-                }
-            } else {
-                // Attempt to pass through unsupported data type formats.
-                buffer[bufPos++] = '%';
-                if (bufPos < static_cast<int>(sizeof(buffer))) {
-                    buffer[bufPos++] = format[fmtPos];
-                }
-            }
-        } else {
-            buffer[bufPos++] = format[fmtPos];
-        }
-        fmtPos++;
-    }
-
-    // Seems to not allocate heap memory via the CRT, but otherwise we could try the WinAPI function WriteFile.
-    fwrite(buffer, 1, bufPos, file);
-}
-inline void fprintf_save(FILE* file, const char* format, ...) {
-    va_list vlist;
-    va_start(vlist, format);
-    vfprintf_save(file, format, vlist);
-    va_end(vlist);
-}
-#else
-/**
- * On Linux, there is no global heap lock (unlike Windows).
- * We can use "hooked_alloc" to forward internal allocations directly to the original functions.
- * Still, in the long run, it may also make sense to avoid heap memory allocations and use the Windows function above.
- */
-#define fprintf_save fprintf
-#define vfprintf_save vfprintf
-#endif
+#include "fprintf_save.hpp"
 
 #if !defined(_WIN32) && defined(HOOK_MALLOC)
 #define fprintf_wrapper(...) \
@@ -379,16 +272,20 @@ VK_LAYER_EXPORT uint64_t memstats_gettimestamp() {
 
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     if (allocType == AllocType::CPU) {
-        fprintf_save(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",0x%p\n",
-                getTimeStamp(), int(allocType), memSize, ptr);
+        fprintf_save(
+                MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",0x%" PRIxPTR "\n",
+                getTimeStamp(), int(allocType), memSize, reinterpret_cast<uintptr_t>(ptr));
     } else {
-        fprintf_save(MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",0x%p,%u\n",
-                getTimeStamp(), int(allocType), memSize, ptr, memoryTypeIndex);
+        fprintf_save(
+                MemStatsLayer_outFile, "alloc,%" PRIu64 ",%d,%" PRIu64 ",0x%" PRIxPTR ",%u\n",
+                getTimeStamp(), int(allocType), memSize, reinterpret_cast<uintptr_t>(ptr), memoryTypeIndex);
     }
 }
 
 static void removeAllocation(AllocType allocType, void* ptr) {
-    fprintf_save(MemStatsLayer_outFile, "free,%" PRIu64 ",%d,0x%p\n", getTimeStamp(), int(allocType), ptr);
+    fprintf_save(
+            MemStatsLayer_outFile, "free,%" PRIu64 ",%d,0x%" PRIxPTR "\n",
+            getTimeStamp(), int(allocType), reinterpret_cast<uintptr_t>(ptr));
 }
 
 
@@ -838,8 +735,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindBufferMemory(
     scoped_lock l(globalMutex);
 
     fprintf_wrapper(
-            MemStatsLayer_outFile, "bind_buffer_memory,%" PRIu64 ",0x%p,0x%p,%" PRIu64 "\n",
-            getTimeStamp(), buffer, memory, memoryOffset);
+            MemStatsLayer_outFile, "bind_buffer_memory,%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR ",%" PRIu64 "\n",
+            getTimeStamp(), reinterpret_cast<uintptr_t>(buffer), reinterpret_cast<uintptr_t>(memory), memoryOffset);
 
     return deviceDispatchTables[getDispatchKey(device)].BindBufferMemory(device, buffer, memory, memoryOffset);
 }
@@ -849,8 +746,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BindImageMemory(
     scoped_lock l(globalMutex);
 
     fprintf_wrapper(
-            MemStatsLayer_outFile, "bind_image_memory,%" PRIu64 ",0x%p,0x%p,%" PRIu64 "\n",
-            getTimeStamp(), image, memory, memoryOffset);
+            MemStatsLayer_outFile, "bind_image_memory,%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR ",%" PRIu64 "\n",
+            getTimeStamp(), reinterpret_cast<uintptr_t>(image), reinterpret_cast<uintptr_t>(memory), memoryOffset);
 
     return deviceDispatchTables[getDispatchKey(device)].BindImageMemory(device, image, memory, memoryOffset);
 }
@@ -859,7 +756,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyBuffer(
         VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
-    fprintf_wrapper(MemStatsLayer_outFile, "destroy_buffer,%" PRIu64 ",0x%p\n", getTimeStamp(), buffer);
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "destroy_buffer,%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), reinterpret_cast<uintptr_t>(buffer));
 
     deviceDispatchTables[getDispatchKey(device)].DestroyBuffer(device, buffer, pAllocator);
 }
@@ -868,7 +767,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyImage(
         VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
 
-    fprintf_wrapper(MemStatsLayer_outFile, "destroy_image,%" PRIu64 ",0x%p\n", getTimeStamp(), image);
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "destroy_image,%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), reinterpret_cast<uintptr_t>(image));
 
     deviceDispatchTables[getDispatchKey(device)].DestroyImage(device, image, pAllocator);
 }
@@ -925,8 +826,8 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdUpdateBuffer(
     uint64_t copySize = dataSize;
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
     fprintf_wrapper(
-            MemStatsLayer_outFile, "update_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%p\n",
-            getTimeStamp(), profiler->commandIndex++, copySize, dstBuffer);
+            MemStatsLayer_outFile, "update_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, reinterpret_cast<uintptr_t>(dstBuffer));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_UPDATE_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdUpdateBuffer(
@@ -944,8 +845,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer(
     }
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
     fprintf_wrapper(
-            MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%p,0x%p\n",
-            getTimeStamp(), profiler->commandIndex++, copySize, srcBuffer, dstBuffer);
+            MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(srcBuffer), reinterpret_cast<uintptr_t>(dstBuffer));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBuffer(
@@ -963,8 +865,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImage(
     }
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
     fprintf_wrapper(
-            MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%p,0x%p\n",
-            getTimeStamp(), profiler->commandIndex++, copySize, srcImage, dstImage);
+            MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(srcImage), reinterpret_cast<uintptr_t>(dstImage));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImage(
@@ -982,8 +885,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBufferToImage(
     }
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
     fprintf_wrapper(
-            MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%p,0x%p\n",
-            getTimeStamp(), profiler->commandIndex++, copySize, srcBuffer, dstImage);
+            MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(srcBuffer), reinterpret_cast<uintptr_t>(dstImage));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER_TO_IMAGE);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBufferToImage(
@@ -1001,8 +905,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer(
     }
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
     fprintf_wrapper(
-            MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%p,0x%p\n",
-            getTimeStamp(), profiler->commandIndex++, copySize, srcImage, dstBuffer);
+            MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(srcImage), reinterpret_cast<uintptr_t>(dstBuffer));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer(

@@ -101,7 +101,7 @@ jobs:
           fi
           if [ "$RUNNER_OS" == "Linux" ] && [[ "${{ matrix.target_name }}" == "aarch64-linux"* ]]; then
               sudo apt update
-              sudo apt install -y g++-aarch64-linux-gnu libc6-dev-arm64-cross
+              sudo apt install -y g++-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static qemu-user
               CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE="CMake/aarch64-linux-gnu.toolchain.cmake")
           fi
           if [ "${{ matrix.target_name }}" == *memhook ]]; then
@@ -113,8 +113,24 @@ jobs:
           if [[ "${{ matrix.target_name }}" == *minhook ]]; then
               CMAKE_ARGS+=(-DUSE_MINHOOK=ON)
           fi
-          cmake . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_STATIC_STD_LIBRARIES=ON ${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}
+          cmake . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_STATIC_STD_LIBRARIES=ON -DBUILD_TESTS=ON ${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}
           cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+              if [ "${{ matrix.target_name }}" == "x86_64-windows-gnu" ]; then
+                  build/memstats_tests.exe
+              else
+                  build/Release/memstats_tests.exe
+              fi
+          else
+              if [[ "${{ matrix.target_name }}" == "aarch64-linux"* ]]; then
+                  qemu-aarch64 -L /usr/aarch64-linux-gnu build/memstats_tests
+              else
+                  build/memstats_tests
+              fi
+          fi
 
       - name: Copy files
         run: |
