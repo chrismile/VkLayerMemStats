@@ -72,6 +72,20 @@ Full license text of these licenses is available at https://opensource.org/licen
 
 ----------------------------------------------------------------------------
 
+The license below applies to the SPIRV-Reflect library (third_party/SPIRV-Reflect).
+
+<!--
+Copyright (c) 2015-2026 The Khronos Group Inc.
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
+Files in this repository fall under the `Apache-2.0` license.
+
+Full license text of these licenses is available at https://opensource.org/licenses/Apache-2.0
+
+----------------------------------------------------------------------------
+
 On Windows, the library may statically link in Detours (https://github.com/microsoft/Detours).
 The license below applies to the source and binary portions from Detours, and the executables
 withdll.exe and preload.exe that may be shipped with the Vulkan layer on Windows.

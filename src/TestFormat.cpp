@@ -94,7 +94,15 @@ TEST(FormatTest, TestUint64) {
 }
 
 TEST(FormatTest, TestPointer) {
-    testEquality("0x123a4", "0x%" PRIxPTR, static_cast<uintptr_t>(0x123a4ull));
+    testEquality("0x123a456789", "0x%" PRIxPTR, static_cast<uintptr_t>(0x123a456789ull));
+}
+
+TEST(FormatTest, TestPointerZero) {
+    testEquality("0x0", "0x%" PRIxPTR, static_cast<uintptr_t>(0x0ull));
+}
+
+TEST(FormatTest, TestPointerUpperCase) {
+    testEquality("0x123A456789", "0x%" PRIXPTR, static_cast<uintptr_t>(0x123a456789ull));
 }
 
 TEST(FormatTest, TestMacrosUint64) {

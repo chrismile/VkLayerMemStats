@@ -30,6 +30,13 @@
 #define VKLAYERMEMSTATS_FPRINTF_SAVE_HPP
 
 #if defined(_WIN32) && defined(HOOK_MALLOC)
+static char ascii_char_to_upper_case(char c) {
+    if (c > 96 && c < 123) {
+        c ^= 0x20;
+    }
+    return c;
+}
+
 /**
  * The MSVC CRT seems to have a heap lock in the debug libraries.
  * This means that a deadlock will occur when calling the "malloc" or "new" in the hooked memory allocation functions.
@@ -44,6 +51,7 @@
  * - %llu: Unsigned 64-bit int
  * - %p: Pointer (assumes 64-bit pointer size); standard library dependent (inclusion of "0x", leading zeros)
  * - %llx: uintptr_t (assumes 64-bit pointer size); no leading zeros nor "0x", lower case hexadecimal string
+ * - %llX: Same as %llx, but produces an upper case hexadecimal string
  * Further reads on Windows heap allocation handling for those interested:
  * - https://docs.microsoft.com/en-us/windows/win32/memory/heap-functions
  * - https://learn.microsoft.com/en-us/windows/win32/memory/comparing-memory-allocation-methods
@@ -95,7 +103,7 @@ static void vfprintf_save(FILE* file, const char* format, va_list vlist) {
                     buffer[bufPos++] = temp[i];
                 }
             } else if (format[fmtPos] == 'p') {
-                // Pointer
+                // Pointer (C runtime dependent format)
                 void* ptr = va_arg(vlist, void*);
                 buffer[bufPos++] = '0';
                 if (bufPos < sizeof(buffer)) {
@@ -112,12 +120,20 @@ static void vfprintf_save(FILE* file, const char* format, va_list vlist) {
                     buffer[bufPos++] = temp[i];
                 }
             } else if (format[fmtPos] == 'l' && format[fmtPos + 1] == 'l' && format[fmtPos + 2] == 'x') {
-                // Unsigned 64-bit integer
+                // 64-bit hexadecimal pointer (lower case)
                 fmtPos += 2;
                 uintptr_t num = va_arg(vlist, uintptr_t);
                 _ui64toa_s(num, temp, _countof(temp), 16);
                 for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
                     buffer[bufPos++] = temp[i];
+                }
+            } else if (format[fmtPos] == 'l' && format[fmtPos + 1] == 'l' && format[fmtPos + 2] == 'X') {
+                // 64-bit hexadecimal pointer (upper case)
+                fmtPos += 2;
+                uintptr_t num = va_arg(vlist, uintptr_t);
+                _ui64toa_s(num, temp, _countof(temp), 16);
+                for (int i = 0; temp[i] != 0 && bufPos < static_cast<int>(sizeof(buffer)); i++) {
+                    buffer[bufPos++] = ascii_char_to_upper_case(temp[i]);
                 }
             } else {
                 // Attempt to pass through unsupported data type formats.

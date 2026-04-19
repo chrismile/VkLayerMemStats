@@ -48,12 +48,12 @@ enum class MemStatsLayerQueryType : uint32_t {
 static const char* const QUERY_TYPE_NAMES[] = {
     "ERROR",
     "command_buffer_submission",
-    "cmd_update_buffer", "cmd_copy_buffer", "cmd_copy_image", "cmd_copy_buffer_to_image", "cmd_copy_image_to_buffer",
-    "cmd_dispatch", "cmd_dispatch_indirect",
-    "cmd_draw", "cmd_draw_indirect", "cmd_draw_indirect_count",
-    "cmd_draw_indexed", "cmd_draw_indexed_indirect", "cmd_draw_indexed_indirect_count",
-    "cmd_draw_mesh_tasks", "cmd_draw_mesh_tasks_indirect", "cmd_draw_mesh_tasks_indirect_count",
-    "cmd_trace_rays", "cmd_trace_rays_indirect"
+    "update_buffer", "copy_buffer", "copy_image", "copy_buffer_to_image", "copy_image_to_buffer",
+    "dispatch", "dispatch_indirect",
+    "draw", "draw_indirect", "draw_indirect_count",
+    "draw_indexed", "draw_indexed_indirect", "draw_indexed_indirect_count",
+    "draw_mesh_tasks", "draw_mesh_tasks_indirect", "draw_mesh_tasks_indirect_count",
+    "trace_rays", "trace_rays_indirect"
 };
 
 struct MemStatsLayer_Query {

@@ -20,7 +20,9 @@ if (WIN32)
 endif()
 set(DATA_PATH "${CMAKE_SOURCE_DIR}/Data" CACHE PATH "Location of folder 'Data'")
 
-if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
+if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include"
+        OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/include"
+        OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Reflect/include")
     message(FATAL_ERROR "Error: Submodules are not cloned. Please call \"git submodule update --init --recursive\".")
 endif()
 
@@ -29,10 +31,12 @@ list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libr
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/vk_layer_settings_helper.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/layer_settings_util.cpp")
 list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Utility-Libraries/src/layer/layer_settings_manager.cpp")
+list(APPEND SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SPIRV-Reflect/spirv_reflect.c")
 
 add_library(VkLayer_memstats SHARED ${SOURCES})
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Headers/include)
 target_include_directories(VkLayer_memstats PRIVATE third_party/Vulkan-Utility-Libraries/include)
+target_include_directories(VkLayer_memstats PRIVATE third_party/SPIRV-Reflect)
 target_include_directories(VkLayer_memstats PRIVATE third_party)
 
 if (${USE_STATIC_STD_LIBRARIES})

@@ -269,6 +269,7 @@ VK_LAYER_EXPORT uint64_t memstats_gettimestamp() {
 
 
 #include "Profiler.hpp"
+#include "ShaderUtil.hpp"
 
 static void addAllocation(AllocType allocType, uint64_t memSize, void* ptr, uint32_t memoryTypeIndex) {
     if (allocType == AllocType::CPU) {
@@ -547,6 +548,15 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.BindImageMemory = (PFN_vkBindImageMemory)pGetDeviceProcAddr(*pDevice, "vkBindImageMemory");
     dispatchTable.DestroyBuffer = (PFN_vkDestroyBuffer)pGetDeviceProcAddr(*pDevice, "vkDestroyBuffer");
     dispatchTable.DestroyImage = (PFN_vkDestroyImage)pGetDeviceProcAddr(*pDevice, "vkDestroyImage");
+    dispatchTable.CreateShaderModule = (PFN_vkCreateShaderModule)pGetDeviceProcAddr(*pDevice, "vkCreateShaderModule");
+    dispatchTable.DestroyShaderModule = (PFN_vkDestroyShaderModule)pGetDeviceProcAddr(*pDevice, "vkDestroyShaderModule");
+    dispatchTable.CreateGraphicsPipelines = (PFN_vkCreateGraphicsPipelines)pGetDeviceProcAddr(*pDevice, "vkCreateGraphicsPipelines");
+    dispatchTable.CreateComputePipelines = (PFN_vkCreateComputePipelines)pGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
+    if (hasRayTracingPipelineKHR && hasRequestedRayTracingPipelineKHR) {
+        dispatchTable.CreateRayTracingPipelinesKHR = (PFN_vkCreateRayTracingPipelinesKHR)pGetDeviceProcAddr(*pDevice, "vkCreateRayTracingPipelinesKHR");
+    }
+    dispatchTable.DestroyPipeline = (PFN_vkDestroyPipeline)pGetDeviceProcAddr(*pDevice, "vkDestroyPipeline");
+    dispatchTable.CmdBindPipeline = (PFN_vkCmdBindPipeline)pGetDeviceProcAddr(*pDevice, "vkCmdBindPipeline");
     dispatchTable.BeginCommandBuffer = (PFN_vkBeginCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
     dispatchTable.EndCommandBuffer = (PFN_vkEndCommandBuffer)pGetDeviceProcAddr(*pDevice, "vkEndCommandBuffer");
     dispatchTable.CmdUpdateBuffer = (PFN_vkCmdUpdateBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdUpdateBuffer");
@@ -669,6 +679,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
         profiler->supportsQueries = useProfiler;
         profiler->timestampPeriod = deviceProperties.limits.timestampPeriod;
         profilerMap[getDispatchKey(*pDevice)] = profiler;
+        auto* shaderUtil = new MemStatsLayer_ShaderUtil;
+        shaderUtilMap[getDispatchKey(*pDevice)] = shaderUtil;
     }
     return VK_SUCCESS;
 }
@@ -687,6 +699,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
     }
     delete profiler;
     profilerMap.erase(getDispatchKey(device));
+
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+    delete shaderUtil;
+    shaderUtilMap.erase(getDispatchKey(device));
+
     deviceDispatchTables.erase(getDispatchKey(device));
     deviceLayerSettings.erase(getDispatchKey(device));
 }
@@ -775,6 +792,148 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyImage(
 }
 
 
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateShaderModule(
+        VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+        VkShaderModule* pShaderModule) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].CreateShaderModule(
+            device, pCreateInfo, pAllocator, pShaderModule);
+
+    if (res == VK_SUCCESS) {
+        auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+        shaderUtil->addShaderModule(*pShaderModule, *pCreateInfo);
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyShaderModule(
+        VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator) {
+    scoped_lock l(globalMutex);
+
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+    shaderUtil->removeShaderModule(shaderModule);
+
+    deviceDispatchTables[getDispatchKey(device)].DestroyShaderModule(device, shaderModule, pAllocator);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateGraphicsPipelines(
+        VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+        const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
+        VkPipeline* pPipelines) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].CreateGraphicsPipelines(
+            device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+
+    if (res == VK_SUCCESS) {
+        auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+        auto timeStamp = getTimeStamp();
+        for (uint32_t pipelineIdx = 0; pipelineIdx < createInfoCount; pipelineIdx++) {
+            std::vector<MemStatsLayer_PipelineShaderStage> shaderStages(pCreateInfos[pipelineIdx].stageCount);
+            for (uint32_t stageIdx = 0; stageIdx < pCreateInfos[pipelineIdx].stageCount; stageIdx++) {
+                const auto& stage = pCreateInfos[pipelineIdx].pStages[stageIdx];
+                shaderStages[stageIdx].stage = stage.stage;
+                shaderStages[stageIdx].module = stage.module;
+                shaderStages[stageIdx].pName = stage.pName;
+            }
+            auto shaderStagesString = shaderUtil->addPipeline(
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_GRAPHICS, shaderStages);
+            fprintf_wrapper(
+                    MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
+                    timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "graphics", shaderStagesString.c_str());
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateComputePipelines(
+        VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+        const VkComputePipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
+        VkPipeline* pPipelines) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].CreateComputePipelines(
+            device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+
+    if (res == VK_SUCCESS) {
+        auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+        auto timeStamp = getTimeStamp();
+        for (uint32_t pipelineIdx = 0; pipelineIdx < createInfoCount; pipelineIdx++) {
+            std::vector<MemStatsLayer_PipelineShaderStage> shaderStages(1);
+            shaderStages[0].stage = pCreateInfos[pipelineIdx].stage.stage;
+            shaderStages[0].module = pCreateInfos[pipelineIdx].stage.module;
+            shaderStages[0].pName = pCreateInfos[pipelineIdx].stage.pName;
+            auto shaderStagesString = shaderUtil->addPipeline(
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_COMPUTE, shaderStages);
+            fprintf_wrapper(
+                    MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
+                    timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "graphics", shaderStagesString.c_str());
+
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateRayTracingPipelinesKHR(
+        VkDevice device, VkDeferredOperationKHR deferredOperation, VkPipelineCache pipelineCache,
+        uint32_t createInfoCount, const VkRayTracingPipelineCreateInfoKHR* pCreateInfos,
+        const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines) {
+    scoped_lock l(globalMutex);
+
+    VkResult res = deviceDispatchTables[getDispatchKey(device)].CreateRayTracingPipelinesKHR(
+            device, deferredOperation, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+
+    if (res == VK_SUCCESS) {
+        auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+        auto timeStamp = getTimeStamp();
+        for (uint32_t pipelineIdx = 0; pipelineIdx < createInfoCount; pipelineIdx++) {
+            std::vector<MemStatsLayer_PipelineShaderStage> shaderStages(pCreateInfos[pipelineIdx].stageCount);
+            for (uint32_t stageIdx = 0; stageIdx < pCreateInfos[pipelineIdx].stageCount; stageIdx++) {
+                const auto& stage = pCreateInfos[pipelineIdx].pStages[stageIdx];
+                shaderStages[stageIdx].stage = stage.stage;
+                shaderStages[stageIdx].module = stage.module;
+                shaderStages[stageIdx].pName = stage.pName;
+            }
+            auto shaderStagesString = shaderUtil->addPipeline(
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, shaderStages);
+            fprintf_wrapper(
+                    MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
+                    timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "ray_tracing", shaderStagesString.c_str());
+        }
+    }
+
+    return res;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyPipeline(
+        VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* pAllocator) {
+    scoped_lock l(globalMutex);
+
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+    shaderUtil->removePipeline(pipeline);
+
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "destroy_pipeline,%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), reinterpret_cast<uintptr_t>(pipeline));
+    deviceDispatchTables[getDispatchKey(device)].DestroyPipeline(device, pipeline, pAllocator);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdBindPipeline(
+        VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline) {
+    scoped_lock l(globalMutex);
+
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdBindPipeline(
+            commandBuffer, pipelineBindPoint, pipeline);
+
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    shaderUtil->bindPipeline(commandBuffer, pipelineBindPoint, pipeline);
+}
+
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BeginCommandBuffer(
         VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
     scoped_lock l(globalMutex);
@@ -786,6 +945,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_BeginCommandBuffer(
             getTimeStamp(), profiler->commandIndex++);
 
     VkResult res = deviceDispatchTables[getDispatchKey(commandBuffer)].BeginCommandBuffer(commandBuffer, pBeginInfo);
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    shaderUtil->onBeginCommandBuffer(commandBuffer);
 
     if (res == VK_SUCCESS && settings.useProfiler) {
         auto queryAdder = std::make_shared<MemStatsLayer_QueryAdder>(
@@ -814,6 +975,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_EndCommandBuffer(Vk
         }
     }
 
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    shaderUtil->onEndCommandBuffer(commandBuffer);
     return deviceDispatchTables[getDispatchKey(commandBuffer)].EndCommandBuffer(commandBuffer);
 }
 
@@ -920,9 +1083,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDispatch(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "dispatch,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "dispatch,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DISPATCH);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDispatch(
@@ -934,9 +1099,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDispatchIndirect(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "dispatch_indirect,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "dispatch_indirect,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DISPATCH_INDIRECT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDispatchIndirect(commandBuffer, buffer, offset);
@@ -948,9 +1115,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDraw(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDraw(
@@ -962,9 +1131,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndirect(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw_indirect,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_indirect,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDIRECT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndirect(
@@ -977,9 +1148,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndirectCount(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw_indirect_count,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_indirect_count,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDIRECT_COUNT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndirectCount(
@@ -992,9 +1165,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexed(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw_indexed,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_indexed,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexed(
@@ -1006,9 +1181,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexedIndirect(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw_indexed_indirect,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_indexed_indirect,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED_INDIRECT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexedIndirect(
@@ -1021,9 +1198,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawIndexedIndirectC
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "draw_indexed_indirect_count,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_indexed_indirect_count,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_INDEXED_INDIRECT_COUNT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawIndexedIndirectCount(
@@ -1035,9 +1214,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawMeshTasksEXT(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "cmd_draw_mesh_tasks,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_mesh_tasks,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_MESH_TASKS);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawMeshTasksEXT(
@@ -1049,9 +1230,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawMeshTasksIndirec
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "cmd_draw_mesh_tasks_indirect,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_mesh_tasks_indirect,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_MESH_TASKS_INDIRECT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawMeshTasksIndirectEXT(
@@ -1064,9 +1247,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdDrawMeshTasksIndirec
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "cmd_draw_mesh_tasks_indirect_count,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "draw_mesh_tasks_indirect_count,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_DRAW_MESH_TASKS_INDIRECT_COUNT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdDrawMeshTasksIndirectCountEXT(
@@ -1082,9 +1267,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdTraceRaysKHR(
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "trace_rays,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "trace_rays,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_TRACE_RAYS);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdTraceRaysKHR(
@@ -1101,9 +1288,11 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdTraceRaysIndirectKHR
     scoped_lock l(globalMutex);
 
     auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    auto* shaderUtil = shaderUtilMap[getDispatchKey(commandBuffer)];
+    VkPipeline boundPipeline = shaderUtil->getBoundPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     fprintf_wrapper(
-            MemStatsLayer_outFile, "trace_rays_indirect,%" PRIu64 ",%" PRIu64 "\n",
-            getTimeStamp(), profiler->commandIndex++);
+            MemStatsLayer_outFile, "trace_rays_indirect,%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, reinterpret_cast<uintptr_t>(boundPipeline));
 
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_TRACE_RAYS_INDIRECT);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdTraceRaysIndirectKHR(
@@ -1376,6 +1565,15 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetDevice
     GETPROCADDR_VK(BindImageMemory);
     GETPROCADDR_VK(DestroyBuffer);
     GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(CreateShaderModule);
+    GETPROCADDR_VK(DestroyShaderModule);
+    GETPROCADDR_VK(CreateGraphicsPipelines);
+    GETPROCADDR_VK(CreateComputePipelines);
+    if (settings.useRayTracingPipelineKHR) {
+        GETPROCADDR_VK(CreateRayTracingPipelinesKHR);
+    }
+    GETPROCADDR_VK(DestroyPipeline);
+    GETPROCADDR_VK(CmdBindPipeline);
     GETPROCADDR_VK(BeginCommandBuffer);
     GETPROCADDR_VK(EndCommandBuffer);
     GETPROCADDR_VK(CmdUpdateBuffer);
@@ -1432,6 +1630,13 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
     GETPROCADDR_VK(BindImageMemory);
     GETPROCADDR_VK(DestroyBuffer);
     GETPROCADDR_VK(DestroyImage);
+    GETPROCADDR_VK(CreateShaderModule);
+    GETPROCADDR_VK(DestroyShaderModule);
+    GETPROCADDR_VK(CreateGraphicsPipelines);
+    GETPROCADDR_VK(CreateComputePipelines);
+    GETPROCADDR_VK(CreateRayTracingPipelinesKHR);
+    GETPROCADDR_VK(DestroyPipeline);
+    GETPROCADDR_VK(CmdBindPipeline);
     GETPROCADDR_VK(BeginCommandBuffer);
     GETPROCADDR_VK(EndCommandBuffer);
     GETPROCADDR_VK(CmdUpdateBuffer);

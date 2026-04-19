@@ -158,6 +158,12 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Buffer pointer.
 - An entry starting with `destroy_image` is written when `vkDestroyImage` is called.
   Additional entries: Image pointer.
+- An entry starting with `create_pipeline` is written when `vkCreateGraphicsPipelines`, `vkCreateComputePipelines`
+  or `CreateRayTracingPipelinesKHR` are called.
+  Additional entries: Pipeline pointer, bind point string (`graphics`, `compute` or `ray_tracing`),
+  shader stages (format: `{stage:entry_point:shader_file_name;...}`, e.g., `{compute:main:my_compute_shader.glsl}`).
+- An entry starting with `destroy_pipeline` is written when `vkDestroyImage` is called.
+  Additional entries: Pipeline pointer.
 - An entry starting with `begin_command_buffer` is written when `vkBeginCommandBuffer` is called.
   Additional entries: Command index.
 - An entry starting with `end_command_buffer` is written when `vkEndCommandBuffer` is called.
@@ -173,9 +179,31 @@ The first entry denotes the type of the record. The second entry is always a tim
 - An entry starting with `copy_image_to_buffer` is written when `vkCmdCopyImageToBuffer` is called.
   Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
 - An entry starting with `dispatch` is written when `vkCmdDispatch` is called.
-  Additional entries: Command index.
+  Additional entries: Command index, pipeline pointer.
 - An entry starting with `dispatch_indirect` is written when `vkCmdDispatchIndirect` is called.
-  Additional entries: Command index.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw` is written when `vkCmdDraw` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_indirect` is written when `vkCmdDrawIndirect` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_indirect_count` is written when `vkCmdDrawIndirectCount` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_indexed` is written when `vkCmdDrawIndexed` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_indexed_indirect` is written when `vkCmdDrawIndexedIndirect` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_indexed_indirect_count` is written when `vkCmdDrawIndexedIndirectCount` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_mesh_tasks` is written when `vkCmdDrawMeshTasksEXT` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_mesh_tasks_indirect` is written when `vkCmdDrawMeshTasksIndirectEXT` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `draw_mesh_tasks_indirect_count` is written when `vkCmdDrawMeshTasksIndirectCountEXT` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `trace_rays` is written when `vkCmdTraceRaysKHR` is called.
+  Additional entries: Command index, pipeline pointer.
+- An entry starting with `trace_rays_indirect` is written when `vkCmdTraceRaysIndirectKHR` is called.
+  Additional entries: Command index, pipeline pointer.
 - An entry starting with `profiler_event` records how long a device command took.
   This command takes four timestamps. The first is the record timestamp, the second the readback timestamp,
   the third the device execution start timestamp, the fourth the device execution stop timestamp.
@@ -186,9 +214,10 @@ The first entry denotes the type of the record. The second entry is always a tim
 # Version history
 
 Version 1:
-- New records: `version`, `profiler_event`
+- New records: `version`, `create_pipeline`, `destroy_pipeline`, `profiler_event`
 - Backwards incompatible changes: `copy_buffer`, `copy_image`, `copy_buffer_to_image` and `copy_image_to_buffer`
   now take a device global command index as the first argument that `profiler_event` can reference.
+- Added pipeline pointer as last entry to `dispatch*`, `draw*` and `trace_rays*` records.
 
 
 # Application-specific logging

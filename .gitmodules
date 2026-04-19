@@ -4,3 +4,6 @@
 [submodule "third_party/Vulkan-Utility-Libraries"]
 	path = third_party/Vulkan-Utility-Libraries
 	url = https://github.com/KhronosGroup/Vulkan-Utility-Libraries.git
+[submodule "third_party/SPIRV-Reflect"]
+	path = third_party/SPIRV-Reflect
+	url = https://github.com/KhronosGroup/SPIRV-Reflect.git
