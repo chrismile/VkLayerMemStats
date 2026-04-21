@@ -618,8 +618,8 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     PFN_vkGetCalibratedTimestampsKHR pGetCalibratedTimestampsKHR = nullptr;
     PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR pGetPhysicalDeviceCalibrateableTimeDomainsKHR = nullptr;
     if (useProfiler && hasCalibratedTimestampsKHR) {
-        pGetCalibratedTimestampsKHR = (PFN_vkGetCalibratedTimestampsKHR)pGetInstanceProcAddr(
-                instance, "vkGetCalibratedTimestampsKHR");
+        pGetCalibratedTimestampsKHR = (PFN_vkGetCalibratedTimestampsKHR)pGetDeviceProcAddr(
+                *pDevice, "vkGetCalibratedTimestampsKHR");
         pGetPhysicalDeviceCalibrateableTimeDomainsKHR = (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR)pGetInstanceProcAddr(
                 instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR");
         uint32_t numTimeDomains = 0;
@@ -1415,15 +1415,20 @@ static void onSubmitDataFinished(void* dispatchKey, MemStatsLayer_SubmitData* su
 static void onSemaphoreSignaled(void* dispatchKey, VkSemaphore semaphore, uint64_t semaphoreValue) {
     auto* profiler = profilerMap[dispatchKey];
     std::vector<MemStatsLayer_SubmitData*> finishedSubmitDataList;
-    for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ++it) {
-        auto& submitData = *it;
+    for (auto it = profiler->submitsInFlight.begin(); it != profiler->submitsInFlight.end(); ) {
+        bool erasedIt = false;
+        auto* submitData = *it;
         for (size_t signalSemIdx = 0; signalSemIdx < submitData->signalSemaphores.size(); signalSemIdx++) {
             if (submitData->submitted && submitData->signalSemaphores.at(signalSemIdx) == semaphore
                     && submitData->signalSemaphoreValues.at(signalSemIdx) <= semaphoreValue) {
-                profiler->submitsInFlight.erase(it);
+                erasedIt = true;
+                profiler->submitsInFlight.erase(it++);
                 finishedSubmitDataList.push_back(submitData);
                 break;
             }
+        }
+        if (!erasedIt) {
+            ++it;
         }
     }
     for (auto* submitData : finishedSubmitDataList) {
@@ -1433,14 +1438,18 @@ static void onSemaphoreSignaled(void* dispatchKey, VkSemaphore semaphore, uint64
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitForFences(
         VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
-    scoped_lock l(globalMutex);
+    PFN_vkWaitForFences WaitForFences;
+    {
+        scoped_lock l(globalMutex);
+        WaitForFences = deviceDispatchTables[getDispatchKey(device)].WaitForFences;
+    }
 
-    VkResult res = deviceDispatchTables[getDispatchKey(device)].WaitForFences(
-            device, fenceCount, pFences, waitAll, timeout);
+    VkResult res = WaitForFences(device, fenceCount, pFences, waitAll, timeout);
     if (res != VK_SUCCESS) {
         return res;
     }
 
+    scoped_lock l(globalMutex);
     void* dispatchKey = getDispatchKey(device);
     const auto& settings = deviceLayerSettings[dispatchKey];
     auto* profiler = profilerMap[dispatchKey];
@@ -1462,13 +1471,18 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitForFences(
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_WaitSemaphores(
         VkDevice device, const VkSemaphoreWaitInfo* pWaitInfo, uint64_t timeout) {
-    scoped_lock l(globalMutex);
+    PFN_vkWaitSemaphores WaitSemaphores;
+    {
+        scoped_lock l(globalMutex);
+        WaitSemaphores = deviceDispatchTables[getDispatchKey(device)].WaitSemaphores;
+    }
 
-    VkResult res = deviceDispatchTables[getDispatchKey(device)].WaitSemaphores(device, pWaitInfo, timeout);
+    VkResult res = WaitSemaphores(device, pWaitInfo, timeout);
     if (res != VK_SUCCESS) {
         return res;
     }
 
+    scoped_lock l(globalMutex);
     void* dispatchKey = getDispatchKey(device);
     const auto& settings = deviceLayerSettings[dispatchKey];
     if (settings.useProfiler) {
