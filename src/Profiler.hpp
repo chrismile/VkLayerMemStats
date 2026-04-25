@@ -38,6 +38,7 @@ enum class MemStatsLayerQueryType : uint32_t {
     UNKNOWN,
     COMMAND_BUFFER_SUBMISSION,
     CMD_UPDATE_BUFFER, CMD_COPY_BUFFER, CMD_COPY_IMAGE, CMD_COPY_BUFFER_TO_IMAGE, CMD_COPY_IMAGE_TO_BUFFER,
+    CMD_COPY_MEMORY, CMD_COPY_MEMORY_TO_IMAGE, CMD_COPY_IMAGE_TO_MEMORY,
     CMD_DISPATCH, CMD_DISPATCH_INDIRECT,
     CMD_DRAW, CMD_DRAW_INDIRECT, CMD_DRAW_INDIRECT_COUNT,
     CMD_DRAW_INDEXED, CMD_DRAW_INDEXED_INDIRECT, CMD_DRAW_INDEXED_INDIRECT_COUNT,
@@ -49,6 +50,7 @@ static const char* const QUERY_TYPE_NAMES[] = {
     "ERROR",
     "command_buffer_submission",
     "update_buffer", "copy_buffer", "copy_image", "copy_buffer_to_image", "copy_image_to_buffer",
+    "copy_memory", "copy_memory_to_image", "copy_image_to_memory",
     "dispatch", "dispatch_indirect",
     "draw", "draw_indirect", "draw_indirect_count",
     "draw_indexed", "draw_indexed_indirect", "draw_indexed_indirect_count",
@@ -165,11 +167,6 @@ inline MemStatsLayer_SubmitData::MemStatsLayer_SubmitData(
     queries.reserve(maxNumQueries);
 }
 
-inline MemStatsLayer_SubmitData::~MemStatsLayer_SubmitData() {
-    pDestroyQueryPool(device, queryPool, nullptr);
-    delete[] queryBuffer;
-}
-
 void MemStatsLayer_SubmitData::reset() {
     commandBuffer = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
@@ -246,6 +243,17 @@ public:
     VkQueryPool queryPool = VK_NULL_HANDLE;
     MemStatsLayer_SubmitData* submitData = nullptr;
 };
+
+inline MemStatsLayer_SubmitData::~MemStatsLayer_SubmitData() {
+    // Blender 5.2.0 alpha seems to terminate without ending command buffers actively being recorded.
+    if (submissionQueryAdder) {
+        submissionQueryAdder->isValid = false;
+        submissionQueryAdder.reset();
+    }
+
+    pDestroyQueryPool(device, queryPool, nullptr);
+    delete[] queryBuffer;
+}
 
 MemStatsLayer_QueryAdder::MemStatsLayer_QueryAdder(
         VkCommandBuffer commandBuffer, MemStatsLayerQueryType queryType) : commandBuffer(commandBuffer) {

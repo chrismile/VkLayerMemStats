@@ -44,11 +44,13 @@ struct MemStatsLayer_PipelineShaderStage {
     VkShaderStageFlagBits stage;
     VkShaderModule module;
     std::string pName;
+    std::string sourceFileName;
 };
 
 struct MemStatsLayer_PipelineData {
-    VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     std::vector<MemStatsLayer_PipelineShaderStage> shaderStages;
+    VkPipelineBindPoint bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    bool isLibrary = false;
 };
 
 struct MemStatsLayer_ShaderUtilCommandBufferData {
@@ -105,12 +107,18 @@ static void parseSpirvModuleName(
 
 class MemStatsLayer_ShaderUtil {
 public:
+    void addInlineShaderModule(const VkShaderModuleCreateInfo& createInfo);
     void addShaderModule(VkShaderModule shaderModule, const VkShaderModuleCreateInfo& createInfo);
     void removeShaderModule(VkShaderModule shaderModule);
     std::string addPipeline(
             VkPipeline pipeline, VkPipelineBindPoint pipelineBindPoint,
-            const std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages);
+            const std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages,
+            bool isLibrary);
     void removePipeline(VkPipeline pipeline);
+    bool getPipelineIsLibrary(VkPipeline pipeline);
+    void getPipelineShaderStages(VkPipeline pipeline, std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages);
+    void fetchInfoFromShaderModule(MemStatsLayer_PipelineShaderStage& shaderStage);
+    void parseInlineShaderModule(MemStatsLayer_PipelineShaderStage& shaderStage, const VkShaderModuleCreateInfo& info);
     void onBeginCommandBuffer(VkCommandBuffer commandBuffer);
     void bindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline);
     void onEndCommandBuffer(VkCommandBuffer commandBuffer);
@@ -137,10 +145,11 @@ void MemStatsLayer_ShaderUtil::removeShaderModule(VkShaderModule shaderModule) {
 
 std::string MemStatsLayer_ShaderUtil::addPipeline(
         VkPipeline pipeline, VkPipelineBindPoint pipelineBindPoint,
-        const std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages) {
+        const std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages, bool isLibrary) {
     MemStatsLayer_PipelineData pipelineData;
-    pipelineData.bindPoint = pipelineBindPoint;
     pipelineData.shaderStages = shaderStages;
+    pipelineData.bindPoint = pipelineBindPoint;
+    pipelineData.isLibrary = isLibrary;
     pipelineMap.insert(std::make_pair(pipeline, pipelineData));
 
     std::string boundShaderNames = "{";
@@ -153,11 +162,7 @@ std::string MemStatsLayer_ShaderUtil::addPipeline(
         boundShaderNames += ":";
         boundShaderNames += shaderStage.pName;
         boundShaderNames += ":";
-        auto itModule = shaderModuleMap.find(shaderStage.module);
-        if (itModule != shaderModuleMap.end()) {
-            boundShaderNames += itModule->second.sourceFileName;
-            itModule->second.sourceFileName;
-        }
+        boundShaderNames += shaderStage.sourceFileName;
     }
     boundShaderNames += "}";
     return boundShaderNames;
@@ -165,6 +170,40 @@ std::string MemStatsLayer_ShaderUtil::addPipeline(
 
 void MemStatsLayer_ShaderUtil::removePipeline(VkPipeline pipeline) {
     pipelineMap.erase(pipeline);
+}
+
+bool MemStatsLayer_ShaderUtil::getPipelineIsLibrary(VkPipeline pipeline) {
+    auto it = pipelineMap.find(pipeline);
+    if (it != pipelineMap.end()) {
+        return it->second.isLibrary;
+    }
+    return false;
+}
+
+void MemStatsLayer_ShaderUtil::getPipelineShaderStages(
+        VkPipeline pipeline, std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages) {
+    auto it = pipelineMap.find(pipeline);
+    if (it != pipelineMap.end()) {
+        shaderStages.reserve(shaderStages.size() + it->second.shaderStages.size());
+        for (const auto& shaderStage : it->second.shaderStages) {
+            shaderStages.push_back(shaderStage);
+        }
+    }
+}
+
+void MemStatsLayer_ShaderUtil::fetchInfoFromShaderModule(MemStatsLayer_PipelineShaderStage& shaderStage) {
+    auto itModule = shaderModuleMap.find(shaderStage.module);
+    if (itModule != shaderModuleMap.end()) {
+        shaderStage.sourceFileName = itModule->second.sourceFileName;
+        itModule->second.sourceFileName;
+    }
+}
+
+void MemStatsLayer_ShaderUtil::parseInlineShaderModule(
+        MemStatsLayer_PipelineShaderStage& shaderStage, const VkShaderModuleCreateInfo& createInfo) {
+    MemStatsLayer_ShaderModuleData shaderModuleData{};
+    parseSpirvModuleName(createInfo.pCode, createInfo.codeSize, shaderModuleData);
+    shaderStage.sourceFileName = shaderModuleData.sourceFileName;
 }
 
 void MemStatsLayer_ShaderUtil::onBeginCommandBuffer(VkCommandBuffer commandBuffer) {

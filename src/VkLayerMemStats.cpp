@@ -422,9 +422,11 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateInstance(
 VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyInstance(
         VkInstance instance, const VkAllocationCallbacks* pAllocator) {
     scoped_lock l(globalMutex);
+    auto pDestroyInstance = instanceDispatchTables[getDispatchKey(instance)].DestroyInstance;
     instanceDispatchTables.erase(getDispatchKey(instance));
     instanceLayerSettings.erase(getDispatchKey(instance));
     instances.erase(getDispatchKey(instance));
+    pDestroyInstance(instance, pAllocator);
 #ifndef HOOK_MALLOC
     --MemStatsLayer_refcount;
     if (MemStatsLayer_refcount == 0) {
@@ -564,6 +566,19 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateDevice(
     dispatchTable.CmdCopyImage = (PFN_vkCmdCopyImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImage");
     dispatchTable.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage");
     dispatchTable.CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImageToBuffer");
+    dispatchTable.CmdCopyBuffer2 = (PFN_vkCmdCopyBuffer2)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer2");
+    dispatchTable.CmdCopyImage2 = (PFN_vkCmdCopyImage2)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImage2");
+    dispatchTable.CmdCopyBufferToImage2 = (PFN_vkCmdCopyBufferToImage2)pGetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage2");
+    dispatchTable.CmdCopyImageToBuffer2 = (PFN_vkCmdCopyImageToBuffer2)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImageToBuffer2");
+    dispatchTable.CmdCopyMemoryKHR = (PFN_vkCmdCopyMemoryKHR)pGetDeviceProcAddr(*pDevice, "vkCmdCopyMemoryKHR");
+    dispatchTable.CmdCopyMemoryToImageKHR = (PFN_vkCmdCopyMemoryToImageKHR)pGetDeviceProcAddr(*pDevice, "vkCmdCopyMemoryToImageKHR");
+    dispatchTable.CmdCopyImageToMemoryKHR = (PFN_vkCmdCopyImageToMemoryKHR)pGetDeviceProcAddr(*pDevice, "vkCmdCopyImageToMemoryKHR");
+    dispatchTable.CopyMemoryToImage = (PFN_vkCopyMemoryToImage)pGetDeviceProcAddr(*pDevice, "vkCopyMemoryToImage");
+    dispatchTable.CopyMemoryToImageEXT = (PFN_vkCopyMemoryToImageEXT)pGetDeviceProcAddr(*pDevice, "vkCopyMemoryToImageEXT");
+    dispatchTable.CopyImageToMemory = (PFN_vkCopyImageToMemory)pGetDeviceProcAddr(*pDevice, "vkCopyImageToMemory");
+    dispatchTable.CopyImageToMemoryEXT = (PFN_vkCopyImageToMemoryEXT)pGetDeviceProcAddr(*pDevice, "vkCopyImageToMemoryEXT");
+    dispatchTable.CopyImageToImage = (PFN_vkCopyImageToImage)pGetDeviceProcAddr(*pDevice, "vkCopyImageToImage");
+    dispatchTable.CopyImageToImageEXT = (PFN_vkCopyImageToImageEXT)pGetDeviceProcAddr(*pDevice, "vkCopyImageToImageEXT");
     dispatchTable.CmdDispatch = (PFN_vkCmdDispatch)pGetDeviceProcAddr(*pDevice, "vkCmdDispatch");
     dispatchTable.CmdDispatchIndirect = (PFN_vkCmdDispatchIndirect)pGetDeviceProcAddr(*pDevice, "vkCmdDispatchIndirect");
     dispatchTable.CmdDraw = (PFN_vkCmdDraw)pGetDeviceProcAddr(*pDevice, "vkCmdDraw");
@@ -690,7 +705,9 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
     scoped_lock l(globalMutex);
     auto* profiler = profilerMap[getDispatchKey(device)];
     for (auto* frameData : profiler->submitsInFlight) {
-        frameData->readBack();
+        if (frameData->submitted) {
+            frameData->readBack();
+        }
         profiler->freeSubmitDataList.push_back(frameData);
     }
     profiler->submitsInFlight.clear();
@@ -704,8 +721,10 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyDevice(
     delete shaderUtil;
     shaderUtilMap.erase(getDispatchKey(device));
 
+    auto pDestroyDevice = deviceDispatchTables[getDispatchKey(device)].DestroyDevice;
     deviceDispatchTables.erase(getDispatchKey(device));
     deviceLayerSettings.erase(getDispatchKey(device));
+    pDestroyDevice(device, pAllocator);
 }
 
 
@@ -818,6 +837,43 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyShaderModule(
     deviceDispatchTables[getDispatchKey(device)].DestroyShaderModule(device, shaderModule, pAllocator);
 }
 
+static void handlePipelineLibraryShaderStages(
+        MemStatsLayer_ShaderUtil* shaderUtil, std::vector<MemStatsLayer_PipelineShaderStage>& shaderStages,
+        const void* pNext) {
+    while (pNext) {
+        auto* baseStructurePtr = reinterpret_cast<const VkBaseInStructure*>(pNext);
+        VkStructureType structureType = baseStructurePtr->sType;
+        if (structureType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) {
+            const auto* pipelineLibraryCreateInfo = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(pNext);
+            for (uint32_t libraryIdx = 0; libraryIdx < pipelineLibraryCreateInfo->libraryCount; libraryIdx++) {
+                shaderUtil->getPipelineShaderStages(pipelineLibraryCreateInfo->pLibraries[libraryIdx], shaderStages);
+            }
+            break;
+        }
+        pNext = baseStructurePtr->pNext;
+    }
+}
+
+static void handleShaderStagePNext(
+        MemStatsLayer_ShaderUtil* shaderUtil, MemStatsLayer_PipelineShaderStage& shaderStage, const void* pNext) {
+    if (shaderStage.module) {
+        shaderUtil->fetchInfoFromShaderModule(shaderStage);
+        return;
+    }
+
+    // https://docs.vulkan.org/samples/latest/samples/extensions/graphics_pipeline_library/README.html#_deprecating_shader_modules
+    while (pNext) {
+        auto* baseStructurePtr = reinterpret_cast<const VkBaseInStructure*>(pNext);
+        VkStructureType structureType = baseStructurePtr->sType;
+        if (structureType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+            const auto* shaderModuleCreateInfo = reinterpret_cast<const VkShaderModuleCreateInfo*>(pNext);
+            shaderUtil->parseInlineShaderModule(shaderStage, *shaderModuleCreateInfo);
+            break;
+        }
+        pNext = baseStructurePtr->pNext;
+    }
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateGraphicsPipelines(
         VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
         const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
@@ -830,6 +886,7 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateGraphicsPipel
     if (res == VK_SUCCESS) {
         auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
         auto timeStamp = getTimeStamp();
+
         for (uint32_t pipelineIdx = 0; pipelineIdx < createInfoCount; pipelineIdx++) {
             std::vector<MemStatsLayer_PipelineShaderStage> shaderStages(pCreateInfos[pipelineIdx].stageCount);
             for (uint32_t stageIdx = 0; stageIdx < pCreateInfos[pipelineIdx].stageCount; stageIdx++) {
@@ -837,12 +894,18 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateGraphicsPipel
                 shaderStages[stageIdx].stage = stage.stage;
                 shaderStages[stageIdx].module = stage.module;
                 shaderStages[stageIdx].pName = stage.pName;
+                handleShaderStagePNext(shaderUtil, shaderStages[stageIdx], stage.pNext);
             }
+
+            handlePipelineLibraryShaderStages(shaderUtil, shaderStages, pCreateInfos[pipelineIdx].pNext);
+            bool isLibrary = (pCreateInfos[pipelineIdx].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0;
             auto shaderStagesString = shaderUtil->addPipeline(
-                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_GRAPHICS, shaderStages);
-            fprintf_wrapper(
-                    MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
-                    timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "graphics", shaderStagesString.c_str());
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_GRAPHICS, shaderStages, isLibrary);
+            if (!isLibrary) {
+                fprintf_wrapper(
+                        MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
+                        timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "graphics", shaderStagesString.c_str());
+            }
         }
     }
 
@@ -866,8 +929,9 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateComputePipeli
             shaderStages[0].stage = pCreateInfos[pipelineIdx].stage.stage;
             shaderStages[0].module = pCreateInfos[pipelineIdx].stage.module;
             shaderStages[0].pName = pCreateInfos[pipelineIdx].stage.pName;
+            handleShaderStagePNext(shaderUtil, shaderStages[0], pCreateInfos[pipelineIdx].stage.pNext);
             auto shaderStagesString = shaderUtil->addPipeline(
-                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_COMPUTE, shaderStages);
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_COMPUTE, shaderStages, false);
             fprintf_wrapper(
                     MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
                     timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "graphics", shaderStagesString.c_str());
@@ -897,9 +961,10 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateRayTracingPip
                 shaderStages[stageIdx].stage = stage.stage;
                 shaderStages[stageIdx].module = stage.module;
                 shaderStages[stageIdx].pName = stage.pName;
+                handleShaderStagePNext(shaderUtil, shaderStages[stageIdx], stage.pNext);
             }
             auto shaderStagesString = shaderUtil->addPipeline(
-                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, shaderStages);
+                    pPipelines[pipelineIdx], VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, shaderStages, false);
             fprintf_wrapper(
                     MemStatsLayer_outFile, "create_pipeline,%" PRIu64 ",0x%" PRIxPTR ",%s,%s\n",
                     timeStamp, reinterpret_cast<uintptr_t>(pPipelines[pipelineIdx]), "ray_tracing", shaderStagesString.c_str());
@@ -914,11 +979,14 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_DestroyPipeline(
     scoped_lock l(globalMutex);
 
     auto* shaderUtil = shaderUtilMap[getDispatchKey(device)];
+    bool isLibrary = shaderUtil->getPipelineIsLibrary(pipeline);
     shaderUtil->removePipeline(pipeline);
 
-    fprintf_wrapper(
-            MemStatsLayer_outFile, "destroy_pipeline,%" PRIu64 ",0x%" PRIxPTR "\n",
-            getTimeStamp(), reinterpret_cast<uintptr_t>(pipeline));
+    if (!isLibrary) {
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "destroy_pipeline,%" PRIu64 ",0x%" PRIxPTR "\n",
+                getTimeStamp(), reinterpret_cast<uintptr_t>(pipeline));
+    }
     deviceDispatchTables[getDispatchKey(device)].DestroyPipeline(device, pipeline, pAllocator);
 }
 
@@ -1075,6 +1143,329 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer(
     PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_BUFFER);
     deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer(
             commandBuffer, srcImage, srcImageLayout, dstBuffer, regionCount, pRegions);
+}
+
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer2(
+        VkCommandBuffer commandBuffer, const VkCopyBufferInfo2* pCopyBufferInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
+        const auto& region = pCopyBufferInfo->pRegions[i];
+        copySize += region.size;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyBufferInfo->srcBuffer), reinterpret_cast<uintptr_t>(pCopyBufferInfo->dstBuffer));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBuffer2(commandBuffer, pCopyBufferInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBuffer2KHR(
+        VkCommandBuffer commandBuffer, const VkCopyBufferInfo2* pCopyBufferInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
+        const auto& region = pCopyBufferInfo->pRegions[i];
+        copySize += region.size;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyBufferInfo->srcBuffer), reinterpret_cast<uintptr_t>(pCopyBufferInfo->dstBuffer));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBuffer2KHR(commandBuffer, pCopyBufferInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImage2(
+        VkCommandBuffer commandBuffer, const VkCopyImageInfo2* pCopyImageInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyImageInfo->regionCount; i++) {
+        const auto& region = pCopyImageInfo->pRegions[i];
+        copySize += region.extent.width * region.extent.height * region.extent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyImageInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageInfo->dstImage));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImage2(commandBuffer, pCopyImageInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImage2KHR(
+        VkCommandBuffer commandBuffer, const VkCopyImageInfo2* pCopyImageInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyImageInfo->regionCount; i++) {
+        const auto& region = pCopyImageInfo->pRegions[i];
+        copySize += region.extent.width * region.extent.height * region.extent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyImageInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageInfo->dstImage));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImage2KHR(commandBuffer, pCopyImageInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBufferToImage2(
+        VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+        const auto& region = pCopyBufferToImageInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyBufferToImageInfo->srcBuffer), reinterpret_cast<uintptr_t>(pCopyBufferToImageInfo->dstImage));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER_TO_IMAGE);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBufferToImage2(commandBuffer, pCopyBufferToImageInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyBufferToImage2KHR(
+        VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+        const auto& region = pCopyBufferToImageInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_buffer_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyBufferToImageInfo->srcBuffer), reinterpret_cast<uintptr_t>(pCopyBufferToImageInfo->dstImage));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_BUFFER_TO_IMAGE);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyBufferToImage2KHR(commandBuffer, pCopyBufferToImageInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer2(
+        VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; i++) {
+        const auto& region = pCopyImageToBufferInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyImageToBufferInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageToBufferInfo->dstBuffer));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_BUFFER);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer2(commandBuffer, pCopyImageToBufferInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToBuffer2KHR(
+        VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; i++) {
+        const auto& region = pCopyImageToBufferInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image_to_buffer,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyImageToBufferInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageToBufferInfo->dstBuffer));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_BUFFER);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToBuffer2KHR(commandBuffer, pCopyImageToBufferInfo);
+}
+
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyMemoryKHR(
+        VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryInfoKHR* pCopyMemoryInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
+        const auto& region = pCopyMemoryInfo->pRegions[i];
+        copySize += region.dstRange.size;
+    }
+    VkDeviceAddress srcAddr = pCopyMemoryInfo->regionCount == 1 ? pCopyMemoryInfo->pRegions[0].srcRange.address : 0;
+    VkDeviceAddress dstAddr = pCopyMemoryInfo->regionCount == 1 ? pCopyMemoryInfo->pRegions[0].dstRange.address : 0;
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_memory,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize, srcAddr, dstAddr);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_MEMORY);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyMemoryKHR(commandBuffer, pCopyMemoryInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyMemoryToImageKHR(
+        VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
+        const auto& region = pCopyMemoryInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    VkDeviceAddress srcAddr = pCopyMemoryInfo->regionCount == 1 ? pCopyMemoryInfo->pRegions[0].addressRange.address : 0;
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_memory_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            srcAddr, reinterpret_cast<uintptr_t>(pCopyMemoryInfo->image));
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_MEMORY_TO_IMAGE);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyMemoryToImageKHR(commandBuffer, pCopyMemoryInfo);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CmdCopyImageToMemoryKHR(
+        VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo) {
+    scoped_lock l(globalMutex);
+
+    uint64_t copySize = 0;
+    for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
+        const auto& region = pCopyMemoryInfo->pRegions[i];
+        copySize += region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+    }
+    VkDeviceAddress dstAddr = pCopyMemoryInfo->regionCount == 1 ? pCopyMemoryInfo->pRegions[0].addressRange.address : 0;
+    auto* profiler = profilerMap[getDispatchKey(commandBuffer)];
+    fprintf_wrapper(
+            MemStatsLayer_outFile, "copy_image_to_memory,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+            getTimeStamp(), profiler->commandIndex++, copySize,
+            reinterpret_cast<uintptr_t>(pCopyMemoryInfo->image), dstAddr);
+
+    PROFILER_CREATE_QUERY(commandBuffer, MemStatsLayerQueryType::CMD_COPY_IMAGE_TO_MEMORY);
+    deviceDispatchTables[getDispatchKey(commandBuffer)].CmdCopyImageToMemoryKHR(commandBuffer, pCopyMemoryInfo);
+}
+
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyMemoryToImage(
+        VkDevice device, const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyMemoryToImage(device, pCopyMemoryToImageInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyMemoryToImageInfo->regionCount; i++) {
+        const auto& region = pCopyMemoryToImageInfo->pRegions[i];
+        uint64_t copySize = region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_memory_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(region.pHostPointer), reinterpret_cast<uintptr_t>(pCopyMemoryToImageInfo->dstImage));
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyMemoryToImageEXT(
+        VkDevice device, const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyMemoryToImageEXT(device, pCopyMemoryToImageInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyMemoryToImageInfo->regionCount; i++) {
+        const auto& region = pCopyMemoryToImageInfo->pRegions[i];
+        uint64_t copySize = region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_memory_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(region.pHostPointer), reinterpret_cast<uintptr_t>(pCopyMemoryToImageInfo->dstImage));
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyImageToMemory(
+        VkDevice device, const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyImageToMemory(device, pCopyImageToMemoryInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyImageToMemoryInfo->regionCount; i++) {
+        const auto& region = pCopyImageToMemoryInfo->pRegions[i];
+        uint64_t copySize = region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_memory_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(pCopyImageToMemoryInfo->srcImage), reinterpret_cast<uintptr_t>(region.pHostPointer));
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyImageToMemoryEXT(
+        VkDevice device, const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyImageToMemoryEXT(device, pCopyImageToMemoryInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyImageToMemoryInfo->regionCount; i++) {
+        const auto& region = pCopyImageToMemoryInfo->pRegions[i];
+        uint64_t copySize = region.imageExtent.width * region.imageExtent.height * region.imageExtent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_memory_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(pCopyImageToMemoryInfo->srcImage), reinterpret_cast<uintptr_t>(region.pHostPointer));
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyImageToImage(
+        VkDevice device, const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyImageToImage(device, pCopyImageToImageInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyImageToImageInfo->regionCount; i++) {
+        const auto& region = pCopyImageToImageInfo->pRegions[i];
+        uint64_t copySize = region.extent.width * region.extent.height * region.extent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_image_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(pCopyImageToImageInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageToImageInfo->dstImage));
+    }
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL MemStatsLayer_CopyImageToImageEXT(
+        VkDevice device, const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+    scoped_lock l(globalMutex);
+
+    auto timeStampBefore = getTimeStamp();
+    deviceDispatchTables[getDispatchKey(device)].CopyImageToImageEXT(device, pCopyImageToImageInfo);
+    auto timeStampAfter = getTimeStamp();
+
+    for (uint32_t i = 0; i < pCopyImageToImageInfo->regionCount; i++) {
+        const auto& region = pCopyImageToImageInfo->pRegions[i];
+        uint64_t copySize = region.extent.width * region.extent.height * region.extent.depth;
+        fprintf_wrapper(
+                MemStatsLayer_outFile, "host_copy_image_to_image,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",0x%" PRIxPTR ",0x%" PRIxPTR "\n",
+                timeStampBefore, timeStampAfter, copySize,
+                reinterpret_cast<uintptr_t>(pCopyImageToImageInfo->srcImage), reinterpret_cast<uintptr_t>(pCopyImageToImageInfo->dstImage));
+    }
 }
 
 
@@ -1595,6 +1986,19 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetDevice
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);
     GETPROCADDR_VK(CmdCopyImageToBuffer);
+    GETPROCADDR_VK(CmdCopyBuffer2);
+    GETPROCADDR_VK(CmdCopyImage2);
+    GETPROCADDR_VK(CmdCopyBufferToImage2);
+    GETPROCADDR_VK(CmdCopyImageToBuffer2);
+    GETPROCADDR_VK(CmdCopyMemoryKHR);
+    GETPROCADDR_VK(CmdCopyMemoryToImageKHR);
+    GETPROCADDR_VK(CmdCopyImageToMemoryKHR);
+    GETPROCADDR_VK(CopyMemoryToImage);
+    GETPROCADDR_VK(CopyMemoryToImageEXT);
+    GETPROCADDR_VK(CopyImageToMemory);
+    GETPROCADDR_VK(CopyImageToMemoryEXT);
+    GETPROCADDR_VK(CopyImageToImage);
+    GETPROCADDR_VK(CopyImageToImageEXT);
     GETPROCADDR_VK(CmdDispatch);
     GETPROCADDR_VK(CmdDispatchIndirect);
     GETPROCADDR_VK(CmdDraw);
@@ -1658,6 +2062,19 @@ VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL MemStatsLayer_GetInstan
     GETPROCADDR_VK(CmdCopyImage);
     GETPROCADDR_VK(CmdCopyBufferToImage);
     GETPROCADDR_VK(CmdCopyImageToBuffer);
+    GETPROCADDR_VK(CmdCopyBuffer2);
+    GETPROCADDR_VK(CmdCopyImage2);
+    GETPROCADDR_VK(CmdCopyBufferToImage2);
+    GETPROCADDR_VK(CmdCopyImageToBuffer2);
+    GETPROCADDR_VK(CmdCopyMemoryKHR);
+    GETPROCADDR_VK(CmdCopyMemoryToImageKHR);
+    GETPROCADDR_VK(CmdCopyImageToMemoryKHR);
+    GETPROCADDR_VK(CopyMemoryToImage);
+    GETPROCADDR_VK(CopyMemoryToImageEXT);
+    GETPROCADDR_VK(CopyImageToMemory);
+    GETPROCADDR_VK(CopyImageToMemoryEXT);
+    GETPROCADDR_VK(CopyImageToImage);
+    GETPROCADDR_VK(CopyImageToImageEXT);
     GETPROCADDR_VK(CmdDraw);
     GETPROCADDR_VK(CmdDrawIndirect);
     GETPROCADDR_VK(CmdDrawIndirectCount);

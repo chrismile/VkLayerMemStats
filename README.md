@@ -170,14 +170,36 @@ The first entry denotes the type of the record. The second entry is always a tim
   Additional entries: Command index.
 - An entry starting with `update_buffer` is written when `vkCmdUpdateBuffer` is called.
   Additional entries: Command index, copy size in bytes, destination buffer pointer.
-- An entry starting with `copy_buffer` is written when `vkCmdCopyBuffer` is called.
+- An entry starting with `copy_buffer` is written when `vkCmdCopyBuffer` or
+  `vkCmdCopyBuffer2` (from Vulkan 1.3 and `VK_KHR_copy_commands2` for the KHR version) are called.
   Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
-- An entry starting with `copy_image` is written when `vkCmdCopyImage` is called.
-  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
-- An entry starting with `copy_buffer_to_image` is written when `vkCmdCopyBufferToImage` is called.
-  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
-- An entry starting with `copy_image_to_buffer` is written when `vkCmdCopyImageToBuffer` is called.
-  Additional entries: Command index, copy size in bytes, source buffer pointer, destination buffer pointer.
+- An entry starting with `copy_image` is written when `vkCmdCopyImage` or
+  `vkCmdCopyImage2` (from Vulkan 1.3 and `VK_KHR_copy_commands2` for the KHR version) are called.
+  Additional entries: Command index, copy size in bytes, source image pointer, destination image pointer.
+- An entry starting with `copy_buffer_to_image` is written when `vkCmdCopyBufferToImage` or
+  `vkCmdCopyBufferToImage2` (from Vulkan 1.3 and `VK_KHR_copy_commands2` for the KHR version) are called.
+  Additional entries: Command index, copy size in bytes, source buffer pointer, destination image pointer.
+- An entry starting with `copy_image_to_buffer` is written when `vkCmdCopyImageToBuffer` or
+  `vkCmdCopyImageToBuffer2` (from Vulkan 1.3 and `VK_KHR_copy_commands2` for the KHR version) are called.
+  Additional entries: Command index, copy size in bytes, source image pointer, destination buffer pointer.
+- An entry starting with `copy_memory` is written when `vkCmdCopyMemoryKHR` is called (from
+  `VK_KHR_device_address_commands`).
+  Additional entries: Command index, copy size in bytes, source device memory pointer, destination device memory pointer.
+- An entry starting with `copy_memory_to_image` is written when `vkCmdCopyMemoryToImageKHR` is called (from
+  `VK_KHR_device_address_commands`).
+  Additional entries: Command index, copy size in bytes, source device memory pointer, destination image pointer.
+- An entry starting with `copy_image_to_memory` is written when `vkCmdCopyImageToMemoryKHR` is called (from
+  `VK_KHR_device_address_commands`).
+  Additional entries: Command index, copy size in bytes, source image pointer, destination device memory pointer.
+- An entry starting with `host_copy_memory_to_image` is written when `vkCopyMemoryToImage` is called (from
+  Vulkan 1.4 and `VK_EXT_host_image_copy` for the EXT version).
+  Additional entries: Execution stop timestamp, copy size in bytes, source host pointer, destination image pointer.
+- An entry starting with `host_copy_image_to_memory` is written when `vkCopyImageToMemory` is called (from
+  Vulkan 1.4 and `VK_EXT_host_image_copy` for the EXT version).
+  Additional entries: Execution stop timestamp, copy size in bytes, source image pointer, destination host pointer.
+- An entry starting with `host_copy_image_to_image` is written when `vkCopyImageToImage` is called (from
+  Vulkan 1.4 and `VK_EXT_host_image_copy` for the EXT version).
+  Additional entries: Execution stop timestamp, copy size in bytes, source image pointer, destination image pointer.
 - An entry starting with `dispatch` is written when `vkCmdDispatch` is called.
   Additional entries: Command index, pipeline pointer.
 - An entry starting with `dispatch_indirect` is written when `vkCmdDispatchIndirect` is called.
@@ -237,12 +259,3 @@ Please place `src/memstats.h` somewhere the application source code can find and
   https://stackoverflow.com/questions/69838353/heapalloc-hooking-with-minihook-deadlock-on-windows-10-works-on-windows-7
   to also log the name of the DLL that makes a CPU memory allocation (e.g., to separate application and driver).
 - Capture `memcpy` on the CPU.
-
-Examples for currently uncaptured Vulkan memory copy functionality (see
-https://docs.vulkan.org/spec/latest/chapters/copies.html as a reference):
-- Capture `vkCmdCopyMemoryKHR`, `vkCmdCopyMemoryToImageKHR`, `vkCmdCopyImageToMemoryKHR` (from
-  `VK_KHR_device_address_commands`).
-- `vkCmdCopyBuffer2`, `vkCmdCopyImage2` `vkCmdCopyBufferToImage2`, `vkCmdCopyImageToBuffer2` (from Vulkan 1.3 and
-  `VK_KHR_copy_commands2` for the KHR version).
-- `vkCopyMemoryToImage`, `vkCopyImageToMemory`, `vkCopyImageToImage` (from Vulkan 1.4 and `VK_EXT_host_image_copy` for
-  the EXT version).
