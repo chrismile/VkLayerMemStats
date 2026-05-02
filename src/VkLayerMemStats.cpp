@@ -409,7 +409,16 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL MemStatsLayer_CreateInstance(
         instances[getDispatchKey(*pInstance)] = *pInstance;
 #ifndef HOOK_MALLOC
         if (MemStatsLayer_refcount == 0) {
+#ifdef _WIN32
+            if (fopen_s(&MemStatsLayer_outFile, "memstats.csv", "w") != 0) {
+                throw std::runtime_error("File memstats.csv could not be opened for writing.");
+            }
+#else
             MemStatsLayer_outFile = fopen("memstats.csv", "w");
+            if (!MemStatsLayer_outFile) {
+                throw std::runtime_error("File memstats.csv could not be opened for writing.");
+            }
+#endif
             fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
             initializeTimer();
         }
@@ -2255,6 +2264,9 @@ static void MemStatsLayer_memtrace_init() {
     }
 
     MemStatsLayer_outFile = fopen("memstats.csv", "w");
+    if (!MemStatsLayer_outFile) {
+        throw std::runtime_error("File memstats.csv could not be opened for writing.");
+    }
     initializeTimer();
     fprintf_save(MemStatsLayer_outFile, "version,%d,%d\n", 0, FILE_FORMAT_VERSION_NUMBER);
 
